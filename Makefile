@@ -4,7 +4,7 @@ PKG     := ./...
 GOFILES := $(shell find . -name '*.go' -not -path './website/*')
 
 .DEFAULT_GOAL := help
-.PHONY: help build test run fmt vet lint clean cluster-up cluster-down
+.PHONY: help build test fuzz bench run fmt vet lint clean cluster-up cluster-down
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -14,6 +14,13 @@ build: ## build binaries into bin/
 
 test: ## run all tests with the race detector
 	go test -race -count=1 $(PKG)
+
+fuzz: ## fuzz the RESP parser (FUZZTIME=60s per target)
+	@for f in FuzzReadCommand FuzzReadValue FuzzCommandRoundTrip; do \
+		go test ./internal/resp -run '^$$' -fuzz "^$$f\$$" -fuzztime $${FUZZTIME:-60s} || exit 1; done
+
+bench: ## Go microbenchmarks
+	go test -run '^$$' -bench . -benchmem ./...
 
 run: build ## run a single node on :7000
 	./$(BIN) --port 7000

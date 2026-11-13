@@ -19,3 +19,9 @@
 - At bigger scale I'd: Add a config file (or a central config service), validate the whole
   config in one place with clear errors, and support reloading safe settings at runtime
   (like Redis's `CONFIG SET`) so changes don't require a restart that triggers a failover.
+
+**Update (Iteration 1):** The default `--host` changed from `0.0.0.0` to `127.0.0.1`. There's no
+authentication, so listening on every network interface must be an explicit choice. This
+matches Redis's default `bind 127.0.0.1`. Docker/Kubernetes set `SHARDIS_HOST=0.0.0.0`. It also
+sidesteps macOS's AirPlay Receiver, which listens on `*:7000`: binding the more specific
+`127.0.0.1:7000` still works, while `0.0.0.0:7000` fails with "address already in use".

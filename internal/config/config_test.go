@@ -16,10 +16,10 @@ func TestLoadPrecedence(t *testing.T) {
 		wantPort int
 		wantHost string
 	}{
-		{"defaults", nil, nil, 7000, "0.0.0.0"},
-		{"env overrides default", nil, map[string]string{"SHARDIS_PORT": "7001"}, 7001, "0.0.0.0"},
-		{"flag overrides env", []string{"--port", "7002"}, map[string]string{"SHARDIS_PORT": "7001"}, 7002, "0.0.0.0"},
-		{"host from env", nil, map[string]string{"SHARDIS_HOST": "127.0.0.1"}, 7000, "127.0.0.1"},
+		{"defaults", nil, nil, 7000, "127.0.0.1"},
+		{"env overrides default", nil, map[string]string{"SHARDIS_PORT": "7001"}, 7001, "127.0.0.1"},
+		{"flag overrides env", []string{"--port", "7002"}, map[string]string{"SHARDIS_PORT": "7001"}, 7002, "127.0.0.1"},
+		{"host from env", nil, map[string]string{"SHARDIS_HOST": "0.0.0.0"}, 7000, "0.0.0.0"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

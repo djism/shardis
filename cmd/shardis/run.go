@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net"
+	"strconv"
 
 	"github.com/djism/shardis/internal/config"
+	"github.com/djism/shardis/internal/server"
 )
 
 // run is main without the os.* globals, so tests can drive it with a fake
@@ -14,9 +17,13 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("shardis starting", "host", cfg.Host, "port", cfg.Port)
+	srv := server.New(slog.Default())
+	if err := srv.Listen(net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))); err != nil {
+		return err
+	}
+	slog.Info("shardis listening", "addr", srv.Addr().String())
 
-	<-ctx.Done() // nothing to serve yet; just wait to be told to stop
-	slog.Info("shardis shutting down")
-	return nil
+	err = srv.Serve(ctx) // returns once ctx is cancelled and all connections are closed
+	slog.Info("shardis stopped")
+	return err
 }

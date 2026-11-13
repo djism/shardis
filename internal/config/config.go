@@ -30,7 +30,9 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	fs.SetOutput(io.Discard) // the caller decides how to print errors
 
 	var cfg Config
-	str(fs, getenv, &cfg.Host, "host", "0.0.0.0", "interface to listen on")
+	// Loopback by default, like Redis: there's no auth, so listening on every
+	// interface must be an explicit choice (containers set SHARDIS_HOST=0.0.0.0).
+	str(fs, getenv, &cfg.Host, "host", "127.0.0.1", "interface to listen on")
 	if err := integer(fs, getenv, &cfg.Port, "port", 7000, "client port"); err != nil {
 		return Config{}, err
 	}

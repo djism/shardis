@@ -122,6 +122,8 @@ cmd/shardis/          server binary
 cmd/shardis-observer/ streams cluster events over WebSocket for the website
 cmd/shardis-chaos/    runs chaos scenarios + consistency checker, records traces
 internal/resp/        protocol parser/writer
+internal/server/      TCP listener, per-connection loop, command table
+internal/config/      flags + SHARDIS_* env config
 internal/store/       in-memory keyspace, expiry, eviction
 internal/persist/     AOF + snapshots
 internal/replication/ primary/replica sync
@@ -146,7 +148,16 @@ make build        # build binaries
 make test         # go test -race ./...
 make lint         # go vet + gofmt check (what CI runs first)
 make fmt          # format all Go code
-make run          # single node on :7000 (config: --flag > SHARDIS_* env > default)
+make fuzz         # fuzz the RESP parser (FUZZTIME=60s per target)
+make bench        # Go microbenchmarks
+make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* env > default)
+bash docs/benchmarks/iter-01-ping/run.sh   # PING benchmark vs real redis-server
+```
+
+macOS note: AirPlay Receiver listens on *:7000. Binding 127.0.0.1:7000 (the default) works;
+`--host 0.0.0.0` on port 7000 fails. Benchmarks use ports 7100 / 6399 to stay clear of it.
+
+```
 make cluster-up   # 6-node cluster with docker compose
 make cluster-down
 ```
