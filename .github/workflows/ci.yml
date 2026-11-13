@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # same Go version as go.mod, so laptop and CI never drift
+      - name: lint
+        run: make lint
+      - name: build
+        run: make build
+      - name: test
+        run: make test

@@ -1,0 +1,19 @@
+# build output
+/bin/
+*.test
+*.out
+coverage.*
+
+# data files written by local runs
+*.aof
+*.rdb
+/data/
+
+# website
+node_modules/
+dist/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
