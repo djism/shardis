@@ -1,0 +1,79 @@
+# 6-node Shardis cluster: 3 primaries + 3 replicas (Iteration 7).
+#   make cluster-up    then   redis-cli -c -p 7000
+#   make cluster-down
+# Ports are published on 127.0.0.1 only: on macOS, AirPlay Receiver owns
+# *:7000, and binding the loopback address side-steps it.
+name: shardis
+
+x-node: &node
+  image: shardis:dev
+  pull_policy: never # built locally by shardis-a below; never fetched from a registry
+  environment:
+    SHARDIS_HOST: 0.0.0.0
+    SHARDIS_PORT: "7000"
+    SHARDIS_CLUSTER_CONFIG: /etc/shardis/topology.conf
+    SHARDIS_APPENDONLY: "yes"
+    SHARDIS_DIR: /data
+  restart: unless-stopped
+  stop_grace_period: 10s
+
+services:
+  shardis-a:
+    <<: *node
+    build:
+      context: ../.. # one service builds the image; the others reuse it
+    pull_policy: build
+    container_name: shardis-a
+    command: ["--cluster-node", "a"]
+    ports: ["127.0.0.1:7000:7000"]
+    volumes:
+      - ./topology.conf:/etc/shardis/topology.conf:ro
+      - a-data:/data
+  shardis-b:
+    <<: *node
+    container_name: shardis-b
+    command: ["--cluster-node", "b"]
+    ports: ["127.0.0.1:7001:7000"]
+    volumes:
+      - ./topology.conf:/etc/shardis/topology.conf:ro
+      - b-data:/data
+  shardis-c:
+    <<: *node
+    container_name: shardis-c
+    command: ["--cluster-node", "c"]
+    ports: ["127.0.0.1:7002:7000"]
+    volumes:
+      - ./topology.conf:/etc/shardis/topology.conf:ro
+      - c-data:/data
+  shardis-d:
+    <<: *node
+    container_name: shardis-d
+    command: ["--cluster-node", "d"]
+    ports: ["127.0.0.1:7003:7000"]
+    volumes:
+      - ./topology.conf:/etc/shardis/topology.conf:ro
+      - d-data:/data
+  shardis-e:
+    <<: *node
+    container_name: shardis-e
+    command: ["--cluster-node", "e"]
+    ports: ["127.0.0.1:7004:7000"]
+    volumes:
+      - ./topology.conf:/etc/shardis/topology.conf:ro
+      - e-data:/data
+  shardis-f:
+    <<: *node
+    container_name: shardis-f
+    command: ["--cluster-node", "f"]
+    ports: ["127.0.0.1:7005:7000"]
+    volumes:
+      - ./topology.conf:/etc/shardis/topology.conf:ro
+      - f-data:/data
+
+volumes:
+  a-data:
+  b-data:
+  c-data:
+  d-data:
+  e-data:
+  f-data:

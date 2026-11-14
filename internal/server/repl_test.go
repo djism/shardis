@@ -351,3 +351,16 @@ func TestFaultCommand(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+// Regression: an idle link must stay up well past the replication timeout.
+// (A handshake deadline that also covered writes used to expire and
+// silently break ACKs, so the primary dropped every replica every 2x timeout.)
+func TestIdleLinkStaysUp(t *testing.T) {
+	p, r := startReplNode(t, 1<<20), startReplNode(t, 1<<20)
+	replicate(t, r, p)
+	time.Sleep(5 * time.Second) // timeout is 2 s in these tests
+	info := parseInfo(t, p.client(t).do("INFO", "replication"))
+	if info["sync_full"] != "1" || info["sync_partial_ok"] != "0" || info["connected_slaves"] != "1" {
+		t.Fatalf("link was dropped and re-established: %v", info)
+	}
+}

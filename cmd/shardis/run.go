@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/djism/shardis/internal/cluster"
 	"github.com/djism/shardis/internal/config"
 	"github.com/djism/shardis/internal/events"
 	"github.com/djism/shardis/internal/faults"
@@ -95,6 +96,17 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 		AnnouncePort: cfg.Port, Faults: reg, Bus: bus, Log: slog.Default(),
 	})
 	defer repl.Close() // runs before aof.Close (defers are last-in-first-out)
+	var topo *cluster.Topology
+	if cfg.ClusterConfig != "" {
+		if topo, err = cluster.Load(cfg.ClusterConfig, cfg.ClusterNode); err != nil {
+			return err
+		}
+		slog.Info("cluster mode", "node", topo.Me.Name, "id", topo.Me.ID, "primary", topo.Me.IsPrimary(), "nodes", len(topo.Nodes))
+		if !topo.Me.IsPrimary() { // replicate from our primary's internal address
+			host, port, _ := net.SplitHostPort(topo.Me.Primary.Internal)
+			cfg.ReplicaOf = host + " " + port
+		}
+	}
 	if cfg.ReplicaOf != "" {
 		f := strings.Fields(cfg.ReplicaOf)
 		port, err := strconv.Atoi(f[1])
@@ -107,7 +119,7 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	}
 
 	srv := server.New(server.Options{Log: slog.Default(), Engine: engine, Evictor: evictor, AOF: aof,
-		Repl: repl, Faults: reg, Port: cfg.Port, Hz: cfg.Hz})
+		Repl: repl, Faults: reg, Cluster: topo, Bus: bus, Port: cfg.Port, Hz: cfg.Hz})
 	if err := srv.Listen(addr); err != nil {
 		return err
 	}

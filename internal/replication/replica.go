@@ -42,12 +42,16 @@ func (n *Node) replicaLoop(stop, done chan struct{}) {
 // goroutines (the apply loop answering GETACK, the ack ticker), so they're
 // serialized by mu.
 type replicaConn struct {
-	conn net.Conn
-	r    *resp.Reader
-	mu   sync.Mutex
-	w    *resp.Writer
+	conn    net.Conn
+	r       *resp.Reader
+	mu      sync.Mutex
+	w       *resp.Writer
+	timeout time.Duration
 }
 
+// send writes one command with its own write deadline. (A deadline set once
+// for the handshake would expire later and silently break every ACK; that
+// bug made links drop every 20 s until Iteration 7 caught it.)
 func (c *replicaConn) send(args ...string) error {
 	b := make([][]byte, len(args))
 	for i, a := range args {
@@ -55,6 +59,7 @@ func (c *replicaConn) send(args ...string) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.conn.SetWriteDeadline(time.Now().Add(c.timeout))
 	c.w.WriteCommand(b...)
 	return c.w.Flush()
 }
@@ -84,7 +89,7 @@ func (n *Node) syncOnce(stop chan struct{}) error {
 	if err != nil {
 		return err
 	}
-	c := &replicaConn{conn: conn, r: resp.NewReader(conn), w: resp.NewWriter(conn)}
+	c := &replicaConn{conn: conn, r: resp.NewReader(conn), w: resp.NewWriter(conn), timeout: n.opts.Timeout}
 	finished := make(chan struct{})
 	defer close(finished)
 	go func() { // unblock reads when told to stop (and don't outlive this attempt)
@@ -95,7 +100,7 @@ func (n *Node) syncOnce(stop chan struct{}) error {
 		}
 	}()
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(n.opts.Timeout))
+	conn.SetReadDeadline(time.Now().Add(n.opts.Timeout))
 
 	// Handshake, the same steps a Redis replica takes.
 	if _, err := c.call("PING"); err != nil {
@@ -190,7 +195,10 @@ func (n *Node) applyStream(c *replicaConn, off int64, stop chan struct{}) error 
 			mu.Lock()
 			o := off
 			mu.Unlock()
-			c.send("REPLCONF", "ACK", strconv.FormatInt(o, 10))
+			if err := c.send("REPLCONF", "ACK", strconv.FormatInt(o, 10)); err != nil {
+				c.conn.Close() // a link we can't ack on is dead: reconnect
+				return
+			}
 		}
 	}()
 	c.send("REPLCONF", "ACK", strconv.FormatInt(off, 10))

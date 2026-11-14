@@ -130,11 +130,12 @@ internal/store/       in-memory keyspace (one map per hash slot), engines (shard
 internal/keyslot/     CRC16 + hash tags → slot (verified against real Redis)
 internal/persist/     AOF (effects log, group commit, fsync policies), manifest, fuzzy rewrite
 internal/replication/ PSYNC, backlog, full/partial sync, WAIT, promotion
-internal/cluster/     slots, cluster bus, gossip, failure detection, failover, resharding
+internal/cluster/     topology (slot → node), later: cluster bus, gossip, failover, resharding
 internal/events/      event bus
 internal/faults/      deterministic fault injection (FAULT SET repl.stream pause|delay|sever)
 pkg/client/           our own "smart" cluster client
-deploy/compose/       docker-compose 6-node cluster
+deploy/local/         6-node cluster as local processes (cluster.sh, topology.conf)
+deploy/compose/       docker-compose 6-node cluster (Dockerfile at repo root)
 deploy/k8s/           Kubernetes manifests (StatefulSet etc.)
 website/              showcase site (React + Vite + TypeScript)
 docs/decisions/       design decision records
@@ -161,6 +162,7 @@ make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* en
                   #   (warns below 32mb: the 16384 slot maps alone use ~9-14 MB)
                   # --appendonly yes --appendfsync everysec --dir /data  (ADR 014-016)
                   # --replicaof "host port"  --enable-fault-injection yes (testing only)
+                  # --cluster-config deploy/local/topology.conf --cluster-node a   (ADR 021-023)
 SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
 bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
 bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
@@ -172,6 +174,7 @@ bin/shardis-crashtest -runs 10                    # kill -9 / simulated power cu
 bash docs/benchmarks/iter-05-persistence/run.sh   # crash table + throughput per fsync policy (~10 min)
 bin/shardis-crashtest -failover plain,wait,slowlink,slowlink+wait   # replication lost-write window
 bash docs/benchmarks/iter-06-replication/run.sh   # the full failover table (~4 min)
+bash docs/benchmarks/iter-07-cluster/run.sh       # single node vs cluster, Shardis and Redis (~3 min)
 ```
 
 macOS note: AirPlay Receiver listens on *:7000. Binding 127.0.0.1:7000 (the default) works;
@@ -180,6 +183,9 @@ Benchmark note: don't use `redis-benchmark --threads`; it reports throughput in 
 steps (e.g. always 114,220 req/s) and is slower than the single-threaded client.
 
 ```
-make cluster-up   # 6-node cluster with docker compose
+make cluster-up-local    # 6 local processes on 127.0.0.1:7000-7005 (deploy/local/topology.conf)
+make cluster-down-local
+make cluster-up          # 6 containers with docker compose (deploy/compose), same ports
 make cluster-down
+redis-cli -c -p 7000     # -c follows MOVED; use timeouts in scripts (AirPlay owns *:7000)
 ```

@@ -53,6 +53,10 @@ type Config struct {
 	ReplPingMs           int // primary → replica heartbeat period
 	ReplTimeoutMs        int // a silent link is dead after this long
 	EnableFaultInjection bool
+
+	// Cluster (ADR 021-023). Both set = cluster mode.
+	ClusterConfig string // path to the topology file
+	ClusterNode   string // this node's name in it
 }
 
 // Load builds a Config from args (usually os.Args[1:]) and getenv (usually os.Getenv).
@@ -97,6 +101,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	str(fs, getenv, &faultsOn, "enable-fault-injection", "no", "enable the FAULT admin command (testing only)")
+	str(fs, getenv, &cfg.ClusterConfig, "cluster-config", "", "cluster topology file (enables cluster mode)")
+	str(fs, getenv, &cfg.ClusterNode, "cluster-node", "", "this node's name in the cluster topology file")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -122,6 +128,12 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	}
 	if cfg.EnableFaultInjection, err = yesNo("enable-fault-injection", faultsOn); err != nil {
 		return Config{}, err
+	}
+	if (cfg.ClusterConfig == "") != (cfg.ClusterNode == "") {
+		return Config{}, fmt.Errorf("cluster mode needs both --cluster-config and --cluster-node")
+	}
+	if cfg.ClusterConfig != "" && cfg.ReplicaOf != "" {
+		return Config{}, fmt.Errorf("--replicaof can't be used in cluster mode; the topology file says who replicates whom")
 	}
 	if cfg.ReplicaOf != "" && len(strings.Fields(cfg.ReplicaOf)) != 2 {
 		return Config{}, fmt.Errorf(`replicaof: want "host port", got %q`, cfg.ReplicaOf)

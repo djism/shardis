@@ -4,7 +4,7 @@ PKG     := ./...
 GOFILES := $(shell find . -name '*.go' -not -path './website/*')
 
 .DEFAULT_GOAL := help
-.PHONY: help build test test-memory fuzz bench run fmt vet lint clean cluster-up cluster-down
+.PHONY: help build test test-memory fuzz bench run fmt vet lint clean cluster-up cluster-down cluster-up-local cluster-down-local
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -42,8 +42,15 @@ lint: vet ## fail if any file is not gofmt-formatted
 clean: ## remove build output
 	rm -f $(BIN) bin/shardis-loadgen bin/shardis-crashtest
 
-cluster-up: ## 6-node cluster with docker compose (Iteration 7)
-	@echo "cluster-up arrives in Iteration 7 (deploy/compose)"
+cluster-up-local: ## 6-node cluster as local processes on 127.0.0.1:7000-7005
+	deploy/local/cluster.sh up
 
-cluster-down: ## stop the compose cluster
-	@echo "cluster-down arrives in Iteration 7 (deploy/compose)"
+cluster-down-local: ## stop the local cluster
+	deploy/local/cluster.sh down
+
+cluster-up: ## 6-node cluster with docker compose (clients connect to 127.0.0.1:7000-7005)
+	docker compose -f deploy/compose/docker-compose.yml up -d --build
+	@deploy/compose/wait.sh
+
+cluster-down: ## stop the compose cluster and delete its data
+	docker compose -f deploy/compose/docker-compose.yml down -v

@@ -589,3 +589,30 @@ func TestMaxMemoryOverTheNetwork(t *testing.T) {
 		}
 	})
 }
+
+// COMMAND lists every command with its key positions; cluster clients route by it.
+func TestCommandListsKeyPositions(t *testing.T) {
+	addr, _ := startServer(t)
+	c := newClient(t, addr)
+	c.w.WriteCommand([]byte("COMMAND"))
+	c.w.Flush()
+	v, err := c.r.ReadValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v.Elems) != len(New(Options{}).commands) {
+		t.Fatalf("%d entries", len(v.Elems))
+	}
+	found := map[string][3]int64{}
+	for _, e := range v.Elems {
+		if len(e.Elems) != 10 {
+			t.Fatalf("entry %v has %d fields, want 10", e, len(e.Elems))
+		}
+		found[string(e.Elems[0].Str)] = [3]int64{e.Elems[3].Int, e.Elems[4].Int, e.Elems[5].Int}
+	}
+	for name, want := range map[string][3]int64{"get": {1, 1, 1}, "mset": {1, -1, 2}, "del": {1, -1, 1}, "ping": {0, 0, 0}} {
+		if found[name] != want {
+			t.Errorf("%s key positions %v, want %v", name, found[name], want)
+		}
+	}
+}

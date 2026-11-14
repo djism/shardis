@@ -542,3 +542,77 @@ monitoring lag and having the failover pick the most up-to-date replica."
 
 2. In Demo C, WAIT 1 returned 1 and the write was still lost. What would have prevented it?
 <details><summary>Answer</summary>Either wait for all replicas (WAIT 2), so every candidate for promotion has the write, or make the failover promote the most up-to-date replica, the one with the highest replication offset. Redis Cluster does the second, roughly, by giving the replica with the highest offset the shortest election delay. That's coming in Iteration 9.</details>
+
+## Iteration 7: Hash slots + redirects (a static cluster)
+
+**What we built**
+Shardis runs as a cluster of 3 primaries + 3 replicas that real clients understand. Every node
+knows which node owns each of the 16384 hash slots, from a topology file that's the same on every
+node. A command for someone else's slot gets `-MOVED <slot> <host:port>`, which `redis-cli -c`
+and go-redis's `ClusterClient` follow automatically. Keys in different slots get `-CROSSSLOT`.
+It runs as six local processes or six Docker containers.
+
+**How it works**
+```
+client: SET foo bar ──► node a (slots 0-5460)
+                         slot = CRC16("foo") mod 16384 = 12182 → owned by c
+          ◄── -MOVED 12182 127.0.0.1:7002
+client: SET foo bar ──► node c (slots 10923-16383) ──► OK ──► replicates to its replica f
+```
+- **Every command declares where its keys are** (`GET`: argument 1; `MSET`: every other argument
+  from 1). Dispatch computes the slot *before* running anything, and redirects if it's not ours.
+- **Smart clients avoid the redirect.** They ask `CLUSTER SLOTS` (who owns what) and `COMMAND`
+  (where each command's keys are), compute the slot themselves, and go straight to the right node.
+  `MOVED` is just the correction when their map is out of date.
+- **Replicas** redirect to their primary, unless the client sent `READONLY`. Then they serve reads
+  for that primary's slots, which is how you scale reads.
+- **Hash tags** (`{user:1}:cart`, `{user:1}:profile`) put related keys in one slot, so multi-key
+  commands still work.
+
+**Why we did it this way**
+- *A static topology file (ADR 021):* deterministic in local processes, Docker and soon Kubernetes,
+  and Iteration 8's gossip will start from it.
+- *Routing in dispatch from key positions (ADR 022):* one place, no forgotten checks, and the same
+  data powers `COMMAND` for smart clients.
+- *Client vs internal addresses (ADR 023):* in Docker, containers talk by name (`shardis-c:7000`)
+  while your Mac is told `127.0.0.1:7002`.
+
+**What can go wrong**
+- **Static means frozen.** No node can join, no failover, no slot moves until gossip (Iteration 8),
+  failover (9) and resharding (11). If a primary dies, its slots are down.
+- **Multi-key commands across slots fail by design.** Applications need hash tags.
+- **A real bug from Iteration 6 surfaced here.** Replica links dropped every 20 s, because a
+  handshake deadline also covered *writes* and quietly broke every ACK after 10 s. It's fixed and
+  has a regression test (`TestIdleLinkStaysUp`), which fails with the old code.
+- **The macOS AirPlay trap.** AirPlay Receiver listens on `*:7000` and *accepts* connections without
+  ever replying, so `redis-cli -p 7000` hangs forever if our node isn't up yet. The scripts use
+  timeouts and publish ports on `127.0.0.1` only.
+- **On one laptop the cluster isn't faster:** one benchmark client is the bottleneck, for Redis too.
+
+**Try it yourself**
+```
+make cluster-up-local                 # or: make cluster-up  (Docker Compose)
+redis-cli -c -p 7000 set foo bar      # OK, after following MOVED 12182 → 127.0.0.1:7002
+redis-cli -p 7000 get foo             # MOVED 12182 127.0.0.1:7002   (without -c you see the redirect)
+redis-cli -c -p 7000 mset a 1 b 2     # CROSSSLOT Keys in request don't hash to the same slot
+redis-cli -c -p 7000 mset {u:1}:a 1 {u:1}:b 2   # OK: same slot thanks to the hash tag
+redis-cli -p 7000 cluster nodes       # who owns what
+redis-benchmark --cluster -p 7000 -t set,get -q
+make cluster-down-local
+```
+
+**Interview question you can now answer**
+*"Why does Redis Cluster use 16384 hash slots instead of hashing keys straight onto nodes?"*
+"Because slots are a fixed layer between keys and nodes. A key's slot never changes (CRC16 mod
+16384), and only the slot → node map changes. Adding a node means moving some slots, not
+rehashing every key, and clients can cache a small map of 16384 entries. In my implementation
+every node knows that map. A request for someone else's slot gets MOVED with the right address,
+and smart clients like go-redis cache the map and route directly. Multi-key commands must stay in
+one slot, which is why hash tags exist."
+
+**Check yourself**
+1. A client sends `MSET {cart:7}:items 3 {cart:7}:total 42` to the wrong node. What does it get back, and why not CROSSSLOT?
+<details><summary>Answer</summary>MOVED to the node that owns the slot of "cart:7". With hash tags only the part inside {} is hashed, so both keys are in the same slot: not cross-slot, just the wrong node. The client retries on the owner, which accepts it.</details>
+
+2. Why does a replica answer MOVED for a GET on its own primary's key, even though it has the data?
+<details><summary>Answer</summary>Replicas are asynchronous copies and may be slightly behind, so by default Redis Cluster sends every request, reads included, to the primary for consistency. A client that accepts possibly-stale reads sends READONLY first, and then the replica serves reads for its primary's slots. Writes always go to the primary.</details>

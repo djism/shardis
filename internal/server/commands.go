@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -11,7 +12,29 @@ type command struct {
 	// N > 0 means exactly N arguments, N < 0 means at least -N.
 	arity int
 	flags cmdFlags
-	run   func(cl *client, args [][]byte)
+	// Key positions, Redis-style: the first key's argument index, the last
+	// key's (negative = counted from the end, -1 = last argument), and the
+	// step between keys. 0,0,0 = no keys. Cluster routing uses them to find
+	// a command's slot before running it, and COMMAND tells clients, so
+	// smart clients can route without asking (ADR 022).
+	firstKey, lastKey, step int
+	run                     func(cl *client, args [][]byte)
+}
+
+// keysOf returns the key arguments of a command.
+func (c command) keysOf(args [][]byte) [][]byte {
+	if c.firstKey == 0 || c.firstKey >= len(args) {
+		return nil
+	}
+	last := c.lastKey
+	if last < 0 {
+		last = len(args) + last
+	}
+	var keys [][]byte
+	for i := c.firstKey; i <= last && i < len(args); i += c.step {
+		keys = append(keys, args[i])
+	}
+	return keys
 }
 
 // Command flags, the same idea as Redis's command flags.
@@ -41,6 +64,13 @@ func (s *Server) commandTable() map[string]command {
 		"config":  {arity: -2, run: cmdConfig},
 		"info":    {arity: -1, run: cmdInfo},
 
+		"client": {arity: -2, run: cmdClient},
+
+		// cluster (cmd_cluster.go)
+		"cluster":   {arity: -2, run: cmdCluster},
+		"readonly":  {arity: 1, run: cmdReadOnly},
+		"readwrite": {arity: 1, run: cmdReadWrite},
+
 		// persistence (cmd_persist.go)
 		"bgrewriteaof": {arity: 1, run: cmdBgRewriteAOF},
 
@@ -54,33 +84,33 @@ func (s *Server) commandTable() map[string]command {
 		"fault":     {arity: -2, run: cmdFault},
 
 		// strings (cmd_strings.go)
-		"get":    {arity: 2, run: cmdGet},
-		"set":    {arity: -3, flags: wd, run: cmdSet},
-		"mget":   {arity: -2, run: cmdMGet},
-		"mset":   {arity: -3, flags: wd, run: cmdMSet},
-		"incr":   {arity: 2, flags: wd, run: cmdIncr},
-		"decr":   {arity: 2, flags: wd, run: cmdDecr},
-		"incrby": {arity: 3, flags: wd, run: cmdIncrBy},
-		"decrby": {arity: 3, flags: wd, run: cmdDecrBy},
+		"get":    {arity: 2, firstKey: 1, lastKey: 1, step: 1, run: cmdGet},
+		"set":    {arity: -3, flags: wd, firstKey: 1, lastKey: 1, step: 1, run: cmdSet},
+		"mget":   {arity: -2, firstKey: 1, lastKey: -1, step: 1, run: cmdMGet},
+		"mset":   {arity: -3, flags: wd, firstKey: 1, lastKey: -1, step: 2, run: cmdMSet},
+		"incr":   {arity: 2, flags: wd, firstKey: 1, lastKey: 1, step: 1, run: cmdIncr},
+		"decr":   {arity: 2, flags: wd, firstKey: 1, lastKey: 1, step: 1, run: cmdDecr},
+		"incrby": {arity: 3, flags: wd, firstKey: 1, lastKey: 1, step: 1, run: cmdIncrBy},
+		"decrby": {arity: 3, flags: wd, firstKey: 1, lastKey: 1, step: 1, run: cmdDecrBy},
 
 		// keyspace (cmd_keys.go)
-		"del":      {arity: -2, flags: flagWrite, run: cmdDel},
-		"exists":   {arity: -2, run: cmdExists},
+		"del":      {arity: -2, flags: flagWrite, firstKey: 1, lastKey: -1, step: 1, run: cmdDel},
+		"exists":   {arity: -2, firstKey: 1, lastKey: -1, step: 1, run: cmdExists},
 		"keys":     {arity: 2, run: cmdKeys},
 		"scan":     {arity: -2, run: cmdScan},
 		"dbsize":   {arity: 1, run: cmdDBSize},
 		"flushall": {arity: -1, flags: flagWrite, run: cmdFlushAll},
 
 		// expiry (cmd_expire.go)
-		"expire":      {arity: -3, flags: flagWrite, run: expireCommand("expire", 1000, false)},
-		"pexpire":     {arity: -3, flags: flagWrite, run: expireCommand("pexpire", 1, false)},
-		"expireat":    {arity: -3, flags: flagWrite, run: expireCommand("expireat", 1000, true)},
-		"pexpireat":   {arity: -3, flags: flagWrite, run: expireCommand("pexpireat", 1, true)},
-		"ttl":         {arity: 2, run: ttlCommand(false, false)},
-		"pttl":        {arity: 2, run: ttlCommand(true, false)},
-		"expiretime":  {arity: 2, run: ttlCommand(false, true)},
-		"pexpiretime": {arity: 2, run: ttlCommand(true, true)},
-		"persist":     {arity: 2, flags: flagWrite, run: cmdPersist},
+		"expire":      {arity: -3, flags: flagWrite, firstKey: 1, lastKey: 1, step: 1, run: expireCommand("expire", 1000, false)},
+		"pexpire":     {arity: -3, flags: flagWrite, firstKey: 1, lastKey: 1, step: 1, run: expireCommand("pexpire", 1, false)},
+		"expireat":    {arity: -3, flags: flagWrite, firstKey: 1, lastKey: 1, step: 1, run: expireCommand("expireat", 1000, true)},
+		"pexpireat":   {arity: -3, flags: flagWrite, firstKey: 1, lastKey: 1, step: 1, run: expireCommand("pexpireat", 1, true)},
+		"ttl":         {arity: 2, firstKey: 1, lastKey: 1, step: 1, run: ttlCommand(false, false)},
+		"pttl":        {arity: 2, firstKey: 1, lastKey: 1, step: 1, run: ttlCommand(true, false)},
+		"expiretime":  {arity: 2, firstKey: 1, lastKey: 1, step: 1, run: ttlCommand(false, true)},
+		"pexpiretime": {arity: 2, firstKey: 1, lastKey: 1, step: 1, run: ttlCommand(true, true)},
+		"persist":     {arity: 2, flags: flagWrite, firstKey: 1, lastKey: 1, step: 1, run: cmdPersist},
 	}
 }
 
@@ -96,6 +126,16 @@ func (s *Server) dispatch(cl *client, args [][]byte) {
 		return
 	}
 	cl.cmds.Add(1)
+	// Cluster routing comes first: a command for a slot we don't serve gets
+	// redirected before anything else looks at it (ADR 022).
+	if s.topo != nil {
+		if keys := cmd.keysOf(args); len(keys) > 0 {
+			if redirect := s.route(cl, cmd, keys); redirect != "" {
+				cl.w.WriteError(redirect)
+				return
+			}
+		}
+	}
 	if cmd.flags&flagWrite != 0 && s.repl != nil && s.repl.IsReplica() {
 		cl.w.WriteError("READONLY You can't write against a read only replica.")
 		return
@@ -171,21 +211,75 @@ func cmdQuit(cl *client, _ [][]byte) {
 	cl.quit = true
 }
 
-// COMMAND is a minimal stub. redis-cli calls COMMAND DOCS at startup to power
-// its typing hints; an empty reply just means "no hints" and keeps it happy.
-// Clients like go-redis also call COMMAND to learn key positions; we'll
-// return real metadata once commands take keys (Iteration 2+).
+// COMMAND describes commands the way Redis does, so cluster clients (go-redis
+// and others) can find each command's keys and route it to the right node
+// themselves. Each entry: [name, arity, flags, first key, last key, step,
+// ACL categories, tips, key specs, subcommands]; the last four are empty.
+//
+//	COMMAND                  every command
+//	COMMAND INFO name ...    just those (nil for unknown names)
+//	COMMAND COUNT | LIST     how many / their names
+//	COMMAND DOCS             empty: redis-cli asks at startup for typing hints
 func cmdCommand(cl *client, args [][]byte) {
+	table := cl.srv.commands
 	if len(args) == 1 {
-		cl.w.WriteArrayHeader(0)
+		names := make([]string, 0, len(table))
+		for n := range table {
+			names = append(names, n)
+		}
+		slices.Sort(names)
+		cl.w.WriteArrayHeader(len(names))
+		for _, n := range names {
+			writeCommandInfo(cl, n, table[n])
+		}
 		return
 	}
 	switch sub := strings.ToLower(string(args[1])); sub {
-	case "docs", "info", "list":
+	case "docs":
 		cl.w.WriteArrayHeader(0)
 	case "count":
-		cl.w.WriteInt(int64(len(cl.srv.commands)))
+		cl.w.WriteInt(int64(len(table)))
+	case "list":
+		cl.w.WriteArrayHeader(len(table))
+		for n := range table {
+			cl.w.WriteBulkString(n)
+		}
+	case "info":
+		cl.w.WriteArrayHeader(len(args) - 2)
+		for _, a := range args[2:] {
+			name := strings.ToLower(string(a))
+			if c, ok := table[name]; ok {
+				writeCommandInfo(cl, name, c)
+			} else {
+				cl.w.WriteNullArray()
+			}
+		}
 	default:
 		cl.w.WriteError(fmt.Sprintf("ERR unknown subcommand '%s'. Try COMMAND HELP.", truncate(args[1], 128)))
+	}
+}
+
+func writeCommandInfo(cl *client, name string, c command) {
+	var flags []string
+	if c.flags&flagWrite != 0 {
+		flags = append(flags, "write")
+	} else if c.firstKey > 0 {
+		flags = append(flags, "readonly")
+	}
+	if c.flags&flagDenyOOM != 0 {
+		flags = append(flags, "denyoom")
+	}
+	cl.w.WriteArrayHeader(10)
+	cl.w.WriteBulkString(name)
+	cl.w.WriteInt(int64(c.arity))
+	cl.w.WriteArrayHeader(len(flags))
+	for _, f := range flags {
+		cl.w.WriteSimple(f)
+	}
+	cl.w.WriteInt(int64(c.firstKey))
+	cl.w.WriteInt(int64(c.lastKey))
+	cl.w.WriteInt(int64(c.step))
+	for range 4 { // ACL categories, tips, key specs, subcommands
+		cl.w.WriteArrayHeader(0)
 	}
 }

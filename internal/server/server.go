@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/djism/shardis/internal/cluster"
+	"github.com/djism/shardis/internal/events"
 	"github.com/djism/shardis/internal/faults"
 	"github.com/djism/shardis/internal/persist"
 	"github.com/djism/shardis/internal/replication"
@@ -30,6 +32,8 @@ type Options struct {
 	AOF     *persist.AOF      // nil = no persistence; the caller closes it after Serve returns
 	Repl    *replication.Node // nil = no replication (tests); the caller closes it
 	Faults  *faults.Registry  // nil = FAULT command disabled (the default)
+	Cluster *cluster.Topology // nil = not in cluster mode
+	Bus     *events.Bus       // nil = no events
 	Port    int               // our client port, for INFO
 	Hz      int               // for INFO and CONFIG GET hz
 }
@@ -41,6 +45,8 @@ type Server struct {
 	aof      *persist.AOF
 	repl     *replication.Node
 	faults   *faults.Registry
+	topo     *cluster.Topology
+	bus      *events.Bus
 	hz       int
 	commands map[string]command
 	started  time.Time
@@ -63,7 +69,7 @@ func New(opts Options) *Server {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{
-		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, repl: opts.Repl, faults: opts.Faults, hz: opts.Hz,
+		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, repl: opts.Repl, faults: opts.Faults, topo: opts.Cluster, bus: opts.Bus, hz: opts.Hz,
 		conns: make(map[net.Conn]*client), started: time.Now(),
 	}
 	s.commands = s.commandTable()
@@ -166,6 +172,11 @@ type client struct {
 	w    *resp.Writer
 	quit bool // set by QUIT: flush the reply, then hang up
 
+	// readonly is set by READONLY: in cluster mode, this connection may read
+	// from a replica (for the replica's primary's slots).
+	readonly bool
+	id       int64
+
 	// replPort is the port a replica announced with REPLCONF listening-port.
 	replPort int
 	// takeover, set by PSYNC, turns the connection into a replication link
@@ -188,7 +199,7 @@ func (s *Server) handle(c net.Conn) {
 	log := s.log.With("remote", c.RemoteAddr().String())
 	log.Debug("conn open")
 
-	cl := &client{srv: s}
+	cl := &client{srv: s, id: s.connsTotal.Load()}
 	// Every byte headed for the socket goes through durableConn, which waits
 	// for the AOF first if this connection ran a write (ADR 015).
 	w := resp.NewWriter(durableConn{conn: c, cl: cl})

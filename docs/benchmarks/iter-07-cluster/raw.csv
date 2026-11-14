@@ -1,0 +1,18 @@
+# machine: Apple M4, Darwin 25.6.0, go1.26.1, redis v=8.10.1, 2026-11-14T23:20:22Z, n=1000000
+setup,pipeline,test,rps,avg_ms,min_ms,p50_ms,p95_ms,p99_ms,max_ms
+shardis single node,1,SET,124517.49,0.219,0.024,0.207,0.311,0.407,2.791
+shardis single node,1,GET,118539.59,0.230,0.032,0.207,0.343,0.663,15.223
+shardis single node,16,SET,1494768.25,0.324,0.056,0.287,0.543,1.127,2.511
+shardis single node,16,GET,1445086.75,0.317,0.048,0.287,0.479,0.799,5.519
+shardis cluster (3 primaries),1,SET,107933.08,0.302,0.008,0.191,0.783,1.903,80.831
+shardis cluster (3 primaries),1,GET,124937.54,0.236,0.016,0.191,0.503,0.975,31.599
+shardis cluster (3 primaries),16,SET,998004.00,0.515,0.032,0.239,1.287,4.383,80.639
+shardis cluster (3 primaries),16,GET,1333333.38,0.272,0.032,0.207,0.599,1.255,11.783
+redis single node,1,SET,136649.36,0.197,0.096,0.191,0.271,0.423,1.519
+redis single node,1,GET,119860.95,0.242,0.080,0.207,0.431,0.639,12.551
+redis single node,16,SET,966183.62,0.723,0.192,0.711,0.927,1.055,1.567
+redis single node,16,GET,1308900.50,0.509,0.176,0.503,0.695,0.799,1.255
+redis cluster (3 primaries),1,SET,128949.06,0.239,0.040,0.223,0.391,0.631,9.791
+redis cluster (3 primaries),1,GET,120977.50,0.264,0.040,0.207,0.543,1.103,30.015
+redis cluster (3 primaries),16,SET,999000.94,0.561,0.064,0.495,1.007,1.687,21.407
+redis cluster (3 primaries),16,GET,1333333.38,0.273,0.064,0.247,0.471,0.647,1.847

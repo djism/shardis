@@ -457,3 +457,34 @@ func (t *Tx) emitWrite(op string, key []byte, slot uint16) {
 		t.bus.Emit("key_write", map[string]any{"op": op, "key": string(key), "slot": slot})
 	}
 }
+
+// GroupOf is the DoGroup group that holds slot s.
+func GroupOf(s uint16) int { return shardOf(s) }
+
+// SlotLen counts the live keys in slot s (CLUSTER COUNTKEYSINSLOT). Needs
+// the slot's group (DoGroup) or DoAll.
+func (t *Tx) SlotLen(s uint16) int {
+	t.checkSlot(s)
+	n := 0
+	for _, e := range t.ks.slots[s] {
+		if !e.expiredAt(t.now) {
+			n++
+		}
+	}
+	return n
+}
+
+// SlotKeys returns up to count live keys from slot s (CLUSTER GETKEYSINSLOT).
+func (t *Tx) SlotKeys(s uint16, count int) []string {
+	t.checkSlot(s)
+	var out []string
+	for k, e := range t.ks.slots[s] {
+		if len(out) == count {
+			break
+		}
+		if !e.expiredAt(t.now) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
