@@ -1,0 +1,6 @@
+# machine: Apple M4, Darwin 25.6.0, go1.26.1, redis v=8.10.1, 2026-11-13T22:49:24Z
+server,keys,rss_before_mb,rss_after_mb,rss_bytes_per_key,test,rps,avg_ms,min_ms,p50_ms,p95_ms,p99_ms,max_ms
+shardis-executor,950002,5.0,230.5,249,GET,120627.27,0.226,0.048,0.215,0.319,0.407,5.391
+shardis-sharded,950083,5.1,233.0,252,GET,128369.71,0.210,0.056,0.207,0.271,0.327,1.031
+redis,950029,6.8,83.8,85,GET,137205.58,0.194,0.080,0.191,0.255,0.367,0.879
+# redis INFO used_memory: used_memory:75395120

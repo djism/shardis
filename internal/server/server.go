@@ -14,10 +14,12 @@ import (
 	"sync"
 
 	"github.com/djism/shardis/internal/resp"
+	"github.com/djism/shardis/internal/store"
 )
 
 type Server struct {
 	log      *slog.Logger
+	engine   store.Engine
 	commands map[string]command
 
 	ln net.Listener
@@ -29,8 +31,10 @@ type Server struct {
 	wg sync.WaitGroup // one per connection goroutine
 }
 
-func New(log *slog.Logger) *Server {
-	s := &Server{log: log, conns: make(map[net.Conn]struct{})}
+// New creates a server that runs commands against engine. The caller owns
+// the engine and closes it after Serve returns.
+func New(log *slog.Logger, engine store.Engine) *Server {
+	s := &Server{log: log, engine: engine, conns: make(map[net.Conn]struct{})}
 	s.commands = s.commandTable()
 	return s
 }

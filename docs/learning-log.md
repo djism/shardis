@@ -141,3 +141,89 @@ which the fixed-size write buffer gives me."
 
 2. Why does the parser disconnect on a protocol error instead of skipping ahead to the next `*`?
 <details><summary>Answer</summary>Once framing is broken, we don't know which bytes are headers and which are payload. A value can contain "*" or "\r\n", so "skipping to the next *" could land in the middle of someone's data and run it as a command. Disconnecting is the only safe reset, and it's what Redis does.</details>
+
+## Iteration 2: The keyspace + the concurrency decision
+
+**What we built**
+Shardis now stores data. GET, SET (NX/XX), DEL, EXISTS, INCR/DECR/INCRBY/DECRBY, MGET/MSET, KEYS,
+SCAN, DBSIZE and FLUSHALL all work, with replies checked byte-for-byte against real Redis 8. We
+built two engines that keep commands atomic in different ways, benchmarked them against each other
+and against Redis, and picked **sharded locks**. We also added the event bus, which costs 3.4 ns
+when nobody listens.
+
+**How it works**
+Every command follows the same pattern: parse the arguments, then call `engine.Do(keys, fn)`, then
+write the reply. Inside `fn`, nobody else can touch those keys.
+```
+                    ┌─────────── keyspace: 16384 slot maps ───────────┐
+ conn goroutine ─┐  │ slot 0 {..}  slot 1 {..}  ...  slot 16383 {..}  │
+ conn goroutine ─┼─►│   guarded by 256 locks: lock = slot % 256        │
+ conn goroutine ─┘  └──────────────────────────────────────────────────┘
+   each command: lock its keys' shards (ascending order) → run → unlock → reply
+```
+- A key's slot is `CRC16(key) mod 16384`, exactly like Redis Cluster. `{user:1}:cart` and
+  `{user:1}:name` share a slot because only the part in `{}` is hashed.
+- **Why ascending order?** If command A locks shard 3 then waits for shard 7, while B locks 7 then
+  waits for 3, they wait forever. That's a deadlock. If everyone locks low-to-high, it can't happen.
+- **Safety net:** a command must declare every key it'll touch. If it touches an undeclared key,
+  the `Tx` panics, so the bug shows up in tests and not as a silent race in production.
+- **Replies are written after the lock is released.** Writing to a slow client while holding a
+  lock would freeze everyone else on that shard.
+
+**Why we did it this way**
+We expected the Redis-style single executor to win. It didn't, and the reason is interesting.
+Redis's one thread does the network I/O *and* runs the commands, so it never hands work between
+threads. In Go each connection already has its own goroutine, so "one goroutine owns the data"
+means an extra hand-off per command: wake the executor, then wake the caller back up. Measured:
+- **Single client:** +8 µs per request.
+- **Pipelined:** capped at about 0.9M req/s, while sharded reached 1.5M (faster than Redis 8's
+  1.0–1.4M, because we use several cores and Redis runs commands on one).
+- **Engine alone, 10 cores:** 11M vs 1.8M ops/s.
+
+Atomicity is identical either way, and the same tests pass on both: 100k concurrent INCRs lose
+nothing, exactly one SET NX winner in 20 rounds of 50 racers, and MSET is never seen half-done.
+(ADRs 005, 006, 007.)
+
+**What can go wrong**
+- **KEYS, SCAN, DBSIZE and FLUSHALL take all 256 locks** and stall everyone while they run. KEYS
+  on a million keys will freeze the server, same as in Redis.
+- **Memory: about 3x Redis per key** (250 vs 85 bytes RSS for a 16-byte key and value). Go stores a
+  string header, a slice header and map overhead per key, and the GC lets the heap grow to about
+  2x live data before collecting.
+- **Latency spikes aren't explained yet.** GC is *ruled out*: the longest stop-the-world pause with
+  1M keys was 0.26 ms. But our worst requests (49–69 ms) are still worse than Redis's (22 ms) on the
+  same laptop.
+- **Without pipelining we're about 10% behind Redis.** One goroutine wake-up per request costs more
+  than Redis's event loop, which handles many ready sockets per wake-up.
+
+**Try it yourself**
+```
+make run
+redis-cli -p 7000 set greeting hello          # OK
+redis-cli -p 7000 set greeting x NX           # (nil): already exists
+redis-cli -p 7000 incrby visits 42            # 42
+redis-cli -p 7000 mset {user:1}:name dj {user:1}:city nyc
+redis-cli -p 7000 mget {user:1}:name {user:1}:city nope    # dj, nyc, (nil)
+redis-cli -p 7000 --scan --pattern '{user:1}*'
+redis-benchmark -p 7000 -t set,get -n 100000 -r 100000 -q
+./bin/shardis --port 7001 --engine executor   # try the other engine and compare
+bash docs/benchmarks/iter-02-concurrency/run.sh   # full comparison vs real Redis (~8 min)
+```
+
+**Interview question you can now answer**
+*"Redis is single-threaded. Why didn't you just copy that?"*
+"I built both and measured. Redis's single thread is fast because the same thread reads the socket
+and runs the command, with no hand-off and no locks. In Go, connections already live on their own
+goroutines, so a single owner adds two goroutine wake-ups per command. That cost me 8 µs per request
+and capped pipelined throughput at 0.9M a second. With 256 sharded locks, taken in a fixed order so
+deadlock is impossible, I got 1.5M, faster than Redis on the same laptop. And atomicity was the same:
+the same concurrency tests pass on both. It also fits the cluster model: Redis Cluster only allows
+multi-key ops inside one hash slot, which means exactly one lock for me."
+
+**Check yourself**
+1. Two clients run `MSET a 1 b 1` and `MSET b 2 a 2` at the same time, and `a` and `b` are in
+   different shards. Why can't this deadlock in our design?
+<details><summary>Answer</summary>Do() doesn't lock in the order the keys were given. It builds the set of shards first and always locks them from lowest to highest number. Both commands try to take the lower shard first, so one gets it and the other waits before holding anything. Nobody ever holds one lock while waiting for another that the first is holding.</details>
+
+2. We measured GC stop-the-world pauses under 0.3 ms with 1M keys. Does that mean GC has no effect on latency?
+<details><summary>Answer</summary>No. Stop-the-world pauses are short, but the GC's marking phase runs *concurrently* and uses about 25% of CPU while it runs, and it can make a busy goroutine help with marking ("mark assist"), which slows that request. GC also explains why we use about 2.3x more memory than live data. Short pauses rule out GC as the cause of 50 ms spikes, not as a cost.</details>

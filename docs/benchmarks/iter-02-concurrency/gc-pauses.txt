@@ -1,0 +1,3 @@
+GC pauses (stop-the-world, ms), per engine:
+executor: 23 GCs, avg STW 0.106 ms, max STW 0.143 ms
+sharded: 27 GCs, avg STW 0.134 ms, max STW 0.260 ms

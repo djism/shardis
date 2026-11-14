@@ -124,7 +124,8 @@ cmd/shardis-chaos/    runs chaos scenarios + consistency checker, records traces
 internal/resp/        protocol parser/writer
 internal/server/      TCP listener, per-connection loop, command table
 internal/config/      flags + SHARDIS_* env config
-internal/store/       in-memory keyspace, expiry, eviction
+internal/store/       in-memory keyspace (one map per hash slot), engines (sharded locks / executor), expiry, eviction
+internal/keyslot/     CRC16 + hash tags → slot (verified against real Redis)
 internal/persist/     AOF + snapshots
 internal/replication/ primary/replica sync
 internal/cluster/     slots, cluster bus, gossip, failure detection, failover, resharding
@@ -151,11 +152,17 @@ make fmt          # format all Go code
 make fuzz         # fuzz the RESP parser (FUZZTIME=60s per target)
 make bench        # Go microbenchmarks
 make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* env > default)
-bash docs/benchmarks/iter-01-ping/run.sh   # PING benchmark vs real redis-server
+                  # --engine sharded (default) | executor   (ADR 005)
+SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
+bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
+bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
+bash docs/benchmarks/iter-02-concurrency/gc.sh    # memory per key + GC pauses with ~1M keys
 ```
 
 macOS note: AirPlay Receiver listens on *:7000. Binding 127.0.0.1:7000 (the default) works;
 `--host 0.0.0.0` on port 7000 fails. Benchmarks use ports 7100 / 6399 to stay clear of it.
+Benchmark note: don't use `redis-benchmark --threads`; it reports throughput in coarse
+steps (e.g. always 114,220 req/s) and is slower than the single-threaded client.
 
 ```
 make cluster-up   # 6-node cluster with docker compose

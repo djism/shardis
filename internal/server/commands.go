@@ -3,6 +3,8 @@ package server
 import (
 	"fmt"
 	"strings"
+
+	"github.com/djism/shardis/internal/store"
 )
 
 // command describes one command the server understands.
@@ -18,10 +20,30 @@ type command struct {
 // variable whose initializer refers back to itself.
 func (s *Server) commandTable() map[string]command {
 	return map[string]command{
+		// connection
 		"ping":    {arity: -1, run: cmdPing},
 		"echo":    {arity: 2, run: cmdEcho},
 		"quit":    {arity: -1, run: cmdQuit},
 		"command": {arity: -1, run: cmdCommand},
+		"config":  {arity: -2, run: cmdConfig},
+
+		// strings (cmd_strings.go)
+		"get":    {arity: 2, run: cmdGet},
+		"set":    {arity: -3, run: cmdSet},
+		"mget":   {arity: -2, run: cmdMGet},
+		"mset":   {arity: -3, run: cmdMSet},
+		"incr":   {arity: 2, run: cmdIncr},
+		"decr":   {arity: 2, run: cmdDecr},
+		"incrby": {arity: 3, run: cmdIncrBy},
+		"decrby": {arity: 3, run: cmdDecrBy},
+
+		// keyspace (cmd_keys.go)
+		"del":      {arity: -2, run: cmdDel},
+		"exists":   {arity: -2, run: cmdExists},
+		"keys":     {arity: 2, run: cmdKeys},
+		"scan":     {arity: -2, run: cmdScan},
+		"dbsize":   {arity: 1, run: cmdDBSize},
+		"flushall": {arity: -1, run: cmdFlushAll},
 	}
 }
 
@@ -105,5 +127,36 @@ func cmdCommand(cl *client, args [][]byte) {
 		cl.w.WriteInt(int64(len(cl.srv.commands)))
 	default:
 		cl.w.WriteError(fmt.Sprintf("ERR unknown subcommand '%s'. Try COMMAND HELP.", truncate(args[1], 128)))
+	}
+}
+
+// configValues are the settings CONFIG GET can report. They're the truth
+// about this build: there's no persistence yet, so save is "" and
+// appendonly is "no". redis-benchmark reads these two at startup and warns
+// if it can't. CONFIG SET and real tunables arrive with Iteration 4.
+var configValues = [][2]string{
+	{"save", ""},
+	{"appendonly", "no"},
+}
+
+// CONFIG GET pattern [pattern ...] → flat list of name, value pairs.
+func cmdConfig(cl *client, args [][]byte) {
+	if !strings.EqualFold(string(args[1]), "GET") || len(args) < 3 {
+		cl.w.WriteError(fmt.Sprintf("ERR unknown subcommand '%s'. Try CONFIG HELP.", truncate(args[1], 128)))
+		return
+	}
+	var out [][2]string
+	for _, kv := range configValues {
+		for _, pat := range args[2:] {
+			if store.Match(strings.ToLower(string(pat)), kv[0]) {
+				out = append(out, kv)
+				break
+			}
+		}
+	}
+	cl.w.WriteArrayHeader(2 * len(out))
+	for _, kv := range out {
+		cl.w.WriteBulkString(kv[0])
+		cl.w.WriteBulkString(kv[1])
 	}
 }

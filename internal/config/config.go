@@ -21,6 +21,12 @@ const EnvPrefix = "SHARDIS_"
 type Config struct {
 	Host string // interface to listen on
 	Port int    // client (RESP) port; the cluster bus will use Port+10000
+
+	// Engine picks how commands get exclusive access to data: "sharded"
+	// (256 locks, the default, chosen by benchmark) or "executor" (one
+	// goroutine owns everything, like Redis). See ADR 005. Unknown names are
+	// rejected when the store is created.
+	Engine string
 }
 
 // Load builds a Config from args (usually os.Args[1:]) and getenv (usually os.Getenv).
@@ -33,6 +39,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	// Loopback by default, like Redis: there's no auth, so listening on every
 	// interface must be an explicit choice (containers set SHARDIS_HOST=0.0.0.0).
 	str(fs, getenv, &cfg.Host, "host", "127.0.0.1", "interface to listen on")
+	str(fs, getenv, &cfg.Engine, "engine", "sharded", "concurrency engine: sharded (default) or executor")
 	if err := integer(fs, getenv, &cfg.Port, "port", 7000, "client port"); err != nil {
 		return Config{}, err
 	}

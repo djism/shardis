@@ -7,7 +7,9 @@ import (
 	"strconv"
 
 	"github.com/djism/shardis/internal/config"
+	"github.com/djism/shardis/internal/events"
 	"github.com/djism/shardis/internal/server"
+	"github.com/djism/shardis/internal/store"
 )
 
 // run is main without the os.* globals, so tests can drive it with a fake
@@ -17,11 +19,22 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	if err != nil {
 		return err
 	}
-	srv := server.New(slog.Default())
-	if err := srv.Listen(net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))); err != nil {
+	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+
+	bus := events.NewBus(addr) // node identity for events; a real node ID arrives with the cluster
+	engine, err := store.New(cfg.Engine, bus)
+	if err != nil {
 		return err
 	}
-	slog.Info("shardis listening", "addr", srv.Addr().String())
+	// Closed after Serve returns, i.e. after every connection is gone, so no
+	// command can be mid-flight when the engine stops.
+	defer engine.Close()
+
+	srv := server.New(slog.Default(), engine)
+	if err := srv.Listen(addr); err != nil {
+		return err
+	}
+	slog.Info("shardis listening", "addr", srv.Addr().String(), "engine", engine.Name())
 
 	err = srv.Serve(ctx) // returns once ctx is cancelled and all connections are closed
 	slog.Info("shardis stopped")

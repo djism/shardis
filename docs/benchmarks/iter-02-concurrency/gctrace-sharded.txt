@@ -1,0 +1,29 @@
+2026/11/13 17:49:32 INFO shardis listening addr=127.0.0.1:7103 engine=sharded
+gc 1 @0.719s 0%: 0.039+0.55+0.089 ms clock, 0.39+0.26/0.69/0+0.89 ms cpu, 3->4->2 MB, 4 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 2 @0.721s 0%: 0.065+1.1+0.066 ms clock, 0.65+0.43/0.84/0+0.66 ms cpu, 5->7->5 MB, 6 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 3 @0.725s 0%: 0.063+0.89+0.002 ms clock, 0.63+0.12/2.1/0.004+0.025 ms cpu, 9->10->7 MB, 11 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 4 @0.731s 0%: 0.045+1.2+0.023 ms clock, 0.45+0.12/2.1/0+0.23 ms cpu, 12->13->9 MB, 15 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 5 @0.739s 0%: 0.045+1.9+0.058 ms clock, 0.45+0.41/3.1/0.65+0.58 ms cpu, 16->17->11 MB, 19 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 6 @0.750s 0%: 0.10+3.3+0.066 ms clock, 1.0+0.84/6.8/1.5+0.66 ms cpu, 19->21->13 MB, 22 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 7 @0.763s 0%: 0.014+2.5+0.013 ms clock, 0.14+2.8/6.4/3.7+0.13 ms cpu, 23->24->15 MB, 27 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 8 @0.776s 0%: 0.12+3.7+0.003 ms clock, 1.2+2.7/9.9/4.6+0.037 ms cpu, 27->29->18 MB, 30 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 9 @0.791s 0%: 0.055+5.5+0.003 ms clock, 0.55+2.5/12/6.2+0.035 ms cpu, 33->37->24 MB, 38 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 10 @0.811s 0%: 0.10+6.8+0.092 ms clock, 1.0+1.9/15/5.3+0.92 ms cpu, 41->47->30 MB, 49 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 11 @0.836s 1%: 0.15+5.7+0.003 ms clock, 1.5+2.8/16/12+0.032 ms cpu, 51->55->33 MB, 60 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 12 @0.864s 1%: 0.077+4.7+0.043 ms clock, 0.77+1.1/12/17+0.43 ms cpu, 57->58->36 MB, 67 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 13 @0.910s 1%: 0.060+5.8+0.067 ms clock, 0.60+0.56/15/16+0.67 ms cpu, 61->63->40 MB, 72 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 14 @0.957s 1%: 0.058+5.0+0.056 ms clock, 0.58+1.5/14/24+0.56 ms cpu, 69->70->45 MB, 81 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 15 @0.993s 1%: 0.065+11+0.094 ms clock, 0.65+10/30/12+0.94 ms cpu, 77->85->57 MB, 90 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 16 @1.043s 2%: 0.048+12+0.033 ms clock, 0.48+0.89/33/20+0.33 ms cpu, 99->107->65 MB, 115 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 17 @1.103s 2%: 0.082+13+0.12 ms clock, 0.82+2.2/33/26+1.2 ms cpu, 111->119->71 MB, 131 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 18 @1.179s 2%: 0.13+17+0.10 ms clock, 1.3+4.8/47/16+1.0 ms cpu, 122->132->79 MB, 143 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 19 @1.269s 2%: 0.079+14+0.010 ms clock, 0.79+2.1/43/27+0.10 ms cpu, 136->144->82 MB, 158 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 20 @1.350s 2%: 0.11+9.1+0.042 ms clock, 1.1+0.78/26/40+0.42 ms cpu, 141->142->79 MB, 164 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 21 @1.469s 2%: 0.077+8.9+0.080 ms clock, 0.77+2.0/25/41+0.80 ms cpu, 141->143->85 MB, 159 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 22 @1.605s 2%: 0.10+20+0.12 ms clock, 1.0+2.6/58/36+1.2 ms cpu, 151->163->100 MB, 170 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 23 @1.711s 3%: 0.093+15+0.032 ms clock, 0.93+2.4/43/32+0.32 ms cpu, 179->186->101 MB, 201 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 24 @1.860s 3%: 0.12+18+0.14 ms clock, 1.2+4.7/49/30+1.4 ms cpu, 179->190->109 MB, 203 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 25 @1.976s 3%: 0.074+20+0.12 ms clock, 0.74+1.9/56/36+1.2 ms cpu, 194->206->114 MB, 219 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 26 @2.101s 3%: 0.048+9.8+0.040 ms clock, 0.48+0.86/28/55+0.40 ms cpu, 202->204->107 MB, 228 MB goal, 0 MB stacks, 0 MB globals, 10 P
+gc 27 @4.840s 1%: 0.063+15+0.034 ms clock, 0.63+1.7/43/59+0.34 ms cpu, 188->188->106 MB, 214 MB goal, 0 MB stacks, 0 MB globals, 10 P
+2026/11/13 17:49:39 INFO shardis stopped

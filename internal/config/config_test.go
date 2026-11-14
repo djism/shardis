@@ -54,6 +54,17 @@ func TestLoadErrors(t *testing.T) {
 	}
 }
 
+func TestEngineFlag(t *testing.T) {
+	cfg, err := Load(nil, fakeEnv(nil))
+	if err != nil || cfg.Engine != "sharded" {
+		t.Fatalf("default engine = %q, %v", cfg.Engine, err)
+	}
+	cfg, _ = Load([]string{"--engine", "executor"}, fakeEnv(nil))
+	if cfg.Engine != "executor" {
+		t.Fatalf("engine = %q", cfg.Engine)
+	}
+}
+
 func TestEnvName(t *testing.T) {
 	if got := EnvName("node-timeout"); got != "SHARDIS_NODE_TIMEOUT" {
 		t.Errorf("EnvName = %q", got)

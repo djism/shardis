@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/djism/shardis/internal/store"
 )
 
 // startServer runs a real server on a random localhost port and stops it when
@@ -21,7 +23,16 @@ import (
 // early and reports Serve's result.
 func startServer(t *testing.T) (addr string, stop func() error) {
 	t.Helper()
-	s := New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return startServerWith(t, store.EngineSharded)
+}
+
+func startServerWith(t *testing.T, engineKind string) (addr string, stop func() error) {
+	t.Helper()
+	engine, err := store.New(engineKind, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(slog.New(slog.NewTextHandler(io.Discard, nil)), engine)
 	if err := s.Listen("127.0.0.1:0"); err != nil {
 		t.Fatal(err)
 	}
@@ -46,6 +57,7 @@ func startServer(t *testing.T) (addr string, stop func() error) {
 		if err := stop(); err != nil {
 			t.Error(err)
 		}
+		engine.Close()
 	})
 	return s.Addr().String(), stop
 }
@@ -98,7 +110,11 @@ func TestCommands(t *testing.T) {
 		{"unknown", "*2\r\n$3\r\nFOO\r\n$3\r\nbar\r\n", "-ERR unknown command 'FOO', with args beginning with: 'bar' \r\n"},
 		{"command", "COMMAND\r\n", "*0\r\n"},
 		{"command docs", "COMMAND DOCS\r\n", "*0\r\n"},
-		{"command count", "COMMAND COUNT\r\n", ":4\r\n"},
+		{"command count", "COMMAND COUNT\r\n", fmt.Sprintf(":%d\r\n", len(New(nil, nil).commands))},
+		{"config get", "CONFIG GET save\r\n", "*2\r\n$4\r\nsave\r\n$0\r\n\r\n"},
+		{"config get glob", "CONFIG GET APPEND*\r\n", "*2\r\n$10\r\nappendonly\r\n$2\r\nno\r\n"},
+		{"config get none", "CONFIG GET nope\r\n", "*0\r\n"},
+		{"config set unsupported", "CONFIG SET a b\r\n", "-ERR unknown subcommand 'SET'. Try CONFIG HELP.\r\n"},
 		{"command bad sub", "COMMAND NOPE\r\n", "-ERR unknown subcommand 'NOPE'. Try COMMAND HELP.\r\n"},
 	}
 	// All on one connection, in order: also proves a connection stays usable
