@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 392" width="760" height="392" role="img" aria-labelledby="t d" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+<title id="t">Cache hit rate by eviction policy</title>
+<desc id="d">Dot plot. 1M keys, Zipf 0.99, about 10% of keys fit in memory. shardis allkeys-random: 73.7%; shardis allkeys-lru (5 samples): 77.2%; shardis allkeys-lru (10 samples): 77.2%; shardis exact LRU (same maxmemory): 74.6%; shardis exact LRU (same keys): 77.6%; redis allkeys-random: 73.8%; redis allkeys-lru (5 samples): 77.0%; redis allkeys-lru (10 samples): 77.1%</desc>
+<style>
+  svg { --surface:#fcfcfb; --text:#0b0b0b; --text2:#52514e; --grid:#e6e5e0; --s1:#2a78d6; --s2:#eb6834; }
+  @media (prefers-color-scheme: dark) {
+    svg { --surface:#1a1a19; --text:#f0efec; --text2:#c3c2b7; --grid:#353431; --s1:#3987e5; --s2:#d95926; }
+  }
+  .bg { fill: var(--surface); }
+  .title { fill: var(--text); font-size: 16px; font-weight: 600; }
+  .sub, .tick, .keys { fill: var(--text2); font-size: 12px; }
+  .lab { fill: var(--text); font-size: 13px; }
+  .val { fill: var(--text); font-size: 12px; font-weight: 600; }
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .shardis { fill: var(--s1); } .redis { fill: var(--s2); }
+  .dot { stroke: var(--surface); stroke-width: 2; }
+  .dot:hover { stroke: var(--text); }
+</style>
+<rect class="bg" width="760" height="392"/>
+<text class="title" x="16" y="26">Cache hit rate by eviction policy</text>
+<text class="sub" x="16" y="46">1M keys, Zipf θ=0.99, 100 B values, ~10% of keys fit. Axis starts at 70%.</text>
+<circle class="shardis" cx="460" cy="22" r="5"/><text class="sub" x="470" y="26">Shardis</text>
+<circle class="redis" cx="545" cy="22" r="5"/><text class="sub" x="555" y="26">Redis 8.10</text>
+<line class="grid" x1="300.0" x2="300.0" y1="62" y2="342"/>
+<text class="tick" x="300.0" y="360" text-anchor="middle">70%</text>
+<line class="grid" x1="362.0" x2="362.0" y1="62" y2="342"/>
+<text class="tick" x="362.0" y="360" text-anchor="middle">72%</text>
+<line class="grid" x1="424.0" x2="424.0" y1="62" y2="342"/>
+<text class="tick" x="424.0" y="360" text-anchor="middle">74%</text>
+<line class="grid" x1="486.0" x2="486.0" y1="62" y2="342"/>
+<text class="tick" x="486.0" y="360" text-anchor="middle">76%</text>
+<line class="grid" x1="548.0" x2="548.0" y1="62" y2="342"/>
+<text class="tick" x="548.0" y="360" text-anchor="middle">78%</text>
+<line class="grid" x1="610.0" x2="610.0" y1="62" y2="342"/>
+<text class="tick" x="610.0" y="360" text-anchor="middle">80%</text>
+<text class="tick" x="455.0" y="380" text-anchor="middle">hit rate (higher is better)</text>
+<text class="tick" x="626" y="56">keys in memory</text>
+<text class="lab" x="286" y="91.0" text-anchor="end">Shardis allkeys-random</text>
+<circle class="dot shardis" cx="415.6" cy="87.0" r="6"><title>Shardis allkeys-random: 73.73% hit rate, 114,241 keys resident, 32.0 MB used, 1,135,358 evicted, GET p99 1.344 ms</title></circle>
+<text class="val" x="427.6" y="91.0">73.7%</text>
+<text class="keys" x="626" y="91.0">114k</text>
+<text class="lab" x="286" y="125.0" text-anchor="end">Shardis allkeys-lru (5 samples)</text>
+<circle class="dot shardis" cx="522.9" cy="121.0" r="6"><title>Shardis allkeys-lru (5 samples): 77.19% hit rate, 104,292 keys resident, 32.0 MB used, 1,000,715 evicted, GET p99 1.536 ms</title></circle>
+<text class="val" x="534.9" y="125.0">77.2%</text>
+<text class="keys" x="626" y="125.0">104k</text>
+<text class="lab" x="286" y="159.0" text-anchor="end">Shardis allkeys-lru (10 samples)</text>
+<circle class="dot shardis" cx="524.8" cy="155.0" r="6"><title>Shardis allkeys-lru (10 samples): 77.25% hit rate, 103,445 keys resident, 32.0 MB used, 1,032,744 evicted, GET p99 1.280 ms</title></circle>
+<text class="val" x="536.8" y="159.0">77.2%</text>
+<text class="keys" x="626" y="159.0">103k</text>
+<text class="lab" x="286" y="193.0" text-anchor="end">Shardis exact LRU (same maxmemory)</text>
+<circle class="dot shardis" cx="443.2" cy="189.0" r="6"><title>Shardis exact LRU (same maxmemory): 74.62% hit rate, 76,625 keys resident, 32.0 MB used, 1,240,952 evicted, GET p99 1.216 ms</title></circle>
+<text class="val" x="455.2" y="193.0">74.6%</text>
+<text class="keys" x="626" y="193.0">77k</text>
+<text class="lab" x="286" y="227.0" text-anchor="end">Shardis exact LRU (same keys)</text>
+<circle class="dot shardis" cx="534.7" cy="223.0" r="6"><title>Shardis exact LRU (same keys): 77.57% hit rate, 105,580 keys resident, 42.6 MB used, 1,004,700 evicted, GET p99 1.728 ms</title></circle>
+<text class="val" x="546.7" y="227.0">77.6%</text>
+<text class="keys" x="626" y="227.0">106k</text>
+<line class="grid" x1="16" x2="744" y1="240.0" y2="240.0"/>
+<text class="lab" x="286" y="261.0" text-anchor="end">Redis allkeys-random</text>
+<circle class="dot redis" cx="418.4" cy="257.0" r="6"><title>Redis allkeys-random: 73.82% hit rate, 101,136 keys resident, 18.3 MB used, 973,695 evicted, GET p99 1.472 ms</title></circle>
+<text class="val" x="430.4" y="261.0">73.8%</text>
+<text class="keys" x="626" y="261.0">101k</text>
+<text class="lab" x="286" y="295.0" text-anchor="end">Redis allkeys-lru (5 samples)</text>
+<circle class="dot redis" cx="516.1" cy="291.0" r="6"><title>Redis allkeys-lru (5 samples): 76.97% hit rate, 101,854 keys resident, 18.3 MB used, 956,847 evicted, GET p99 1.152 ms</title></circle>
+<text class="val" x="528.1" y="295.0">77.0%</text>
+<text class="keys" x="626" y="295.0">102k</text>
+<text class="lab" x="286" y="329.0" text-anchor="end">Redis allkeys-lru (10 samples)</text>
+<circle class="dot redis" cx="520.4" cy="325.0" r="6"><title>Redis allkeys-lru (10 samples): 77.11% hit rate, 101,832 keys resident, 18.3 MB used, 915,078 evicted, GET p99 1.152 ms</title></circle>
+<text class="val" x="532.4" y="329.0">77.1%</text>
+<text class="keys" x="626" y="329.0">102k</text>
+</svg>

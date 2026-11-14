@@ -215,6 +215,7 @@ func TestActiveExpiryRespectsBudget(t *testing.T) {
 
 // "Done when": memory actually drops after a mass expiry with no reads.
 func TestMassExpiryFreesMemory(t *testing.T) {
+	skipMemoryTest(t)
 	clk := newFakeClock()
 	e := newSharded(Options{Clock: clk.Now})
 	base := heapAfterGC()
@@ -302,6 +303,7 @@ func TestActiveExpiryRunsAlongsideClients(t *testing.T) {
 // mixes 30k surviving keys into 300k expiring ones and checks the heap ends
 // up close to what 30k keys alone would cost.
 func TestMemoryShrinksWhenMostKeysExpire(t *testing.T) {
+	skipMemoryTest(t)
 	val := make([]byte, 16)
 	persistentOnly := func() uint64 {
 		e := newSharded(Options{})
@@ -344,6 +346,7 @@ func TestMemoryShrinksWhenMostKeysExpire(t *testing.T) {
 // Same problem without TTLs: a mass DEL leaves slot maps sized for their
 // peak. The background pass visits every slot, so it compacts these too.
 func TestMemoryShrinksAfterMassDelete(t *testing.T) {
+	skipMemoryTest(t)
 	e := newSharded(Options{})
 	base := heapAfterGC()
 	for i := range 330000 {

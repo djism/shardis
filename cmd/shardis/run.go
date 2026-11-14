@@ -22,7 +22,11 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
 	bus := events.NewBus(addr) // node identity for events; a real node ID arrives with the cluster
-	engine, err := store.New(cfg.Engine, store.Options{Bus: bus})
+	policy, err := store.ParsePolicy(cfg.MaxMemoryPolicy)
+	if err != nil {
+		return err
+	}
+	engine, err := store.New(cfg.Engine, store.Options{Bus: bus, ExactLRU: policy == store.AllKeysLRUExact})
 	if err != nil {
 		return err
 	}
@@ -43,11 +47,23 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	defer func() { <-expDone }()
 	defer stopExpiry()
 
-	srv := server.New(slog.Default(), engine)
+	evictor, err := store.NewEvictor(engine, cfg.MaxMemory, policy, cfg.MaxMemorySamples)
+	if err != nil {
+		return err
+	}
+	if cfg.MaxMemory > 0 && cfg.MaxMemory < 32<<20 {
+		// The 16,384 slot maps alone take ~9 MB once keys are spread over
+		// every slot (up to ~14 MB with TTLs), so a tiny limit leaves little
+		// room for data and makes eviction very aggressive (ADR 011).
+		slog.Warn("maxmemory is below 32 MB; the hash-slot maps alone use ~9-14 MB", "maxmemory", cfg.MaxMemory)
+	}
+
+	srv := server.New(server.Options{Log: slog.Default(), Engine: engine, Evictor: evictor, Hz: cfg.Hz})
 	if err := srv.Listen(addr); err != nil {
 		return err
 	}
-	slog.Info("shardis listening", "addr", srv.Addr().String(), "engine", engine.Name(), "hz", cfg.Hz)
+	slog.Info("shardis listening", "addr", srv.Addr().String(), "engine", engine.Name(), "hz", cfg.Hz,
+		"maxmemory", cfg.MaxMemory, "policy", policy)
 
 	err = srv.Serve(ctx) // returns once ctx is cancelled and all connections are closed
 	slog.Info("shardis stopped")

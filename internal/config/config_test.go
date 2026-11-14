@@ -44,6 +44,7 @@ func TestLoadErrors(t *testing.T) {
 		{"port too high for bus port", []string{"--port", "60000"}, nil},
 		{"port zero", []string{"--port", "0"}, nil},
 		{"hz zero", []string{"--hz", "0"}, nil},
+		{"bad maxmemory", []string{"--maxmemory", "lots"}, nil},
 		{"hz too high", nil, map[string]string{"SHARDIS_HZ": "501"}},
 		{"unknown flag", []string{"--nope"}, nil},
 	}
@@ -64,6 +65,16 @@ func TestEngineFlag(t *testing.T) {
 	cfg, _ = Load([]string{"--engine", "executor"}, fakeEnv(nil))
 	if cfg.Engine != "executor" {
 		t.Fatalf("engine = %q", cfg.Engine)
+	}
+}
+
+func TestMaxMemoryFlags(t *testing.T) {
+	cfg, err := Load([]string{"--maxmemory", "100mb", "--maxmemory-policy", "allkeys-lru"}, fakeEnv(map[string]string{"SHARDIS_MAXMEMORY_SAMPLES": "10"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxMemory != 100<<20 || cfg.MaxMemoryPolicy != "allkeys-lru" || cfg.MaxMemorySamples != 10 {
+		t.Fatalf("got %+v", cfg)
 	}
 }
 

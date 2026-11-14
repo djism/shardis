@@ -119,6 +119,7 @@ These records feed the "Design decisions" section of the website, so write them 
 
 ```
 cmd/shardis/          server binary
+cmd/shardis-loadgen/  Zipf "cache-aside" load generator (hit rate, latency)
 cmd/shardis-observer/ streams cluster events over WebSocket for the website
 cmd/shardis-chaos/    runs chaos scenarios + consistency checker, records traces
 internal/resp/        protocol parser/writer
@@ -145,8 +146,9 @@ ROADMAP.md            iteration plan
 
 ```
 make help         # list all targets
-make build        # build binaries
+make build        # build binaries (bin/shardis, bin/shardis-loadgen)
 make test         # go test -race ./...
+make test-memory  # heap-measuring tests (skipped under -race; CI runs both)
 make lint         # go vet + gofmt check (what CI runs first)
 make fmt          # format all Go code
 make fuzz         # fuzz the RESP parser (FUZZTIME=60s per target)
@@ -154,11 +156,15 @@ make bench        # Go microbenchmarks
 make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* env > default)
                   # --engine sharded (default) | executor   (ADR 005)
                   # --hz 10   active-expiry cycles per second (ADR 008)
+                  # --maxmemory 64mb --maxmemory-policy allkeys-lru (ADR 011-013)
+                  #   (warns below 32mb: the 16384 slot maps alone use ~9-14 MB)
 SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
 bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
 bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
 bash docs/benchmarks/iter-02-concurrency/gc.sh    # memory per key + GC pauses with ~1M keys
 bash docs/benchmarks/iter-03-expiry/storm.sh      # 1M-key expiry storm vs Redis (~2 min)
+bash docs/benchmarks/iter-04-eviction/run.sh      # eviction hit rates vs Redis (~8 min)
+bin/shardis-loadgen -addr 127.0.0.1:7000          # Zipf cache-aside traffic: hit rate, latency
 ```
 
 macOS note: AirPlay Receiver listens on *:7000. Binding 127.0.0.1:7000 (the default) works;

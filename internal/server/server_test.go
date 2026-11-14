@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"os/exec"
 	"strings"
@@ -36,7 +35,11 @@ func startServerWith(t *testing.T, engineKind string) (addr string, stop func() 
 	expCtx, stopExpirer := context.WithCancel(context.Background())
 	expDone := make(chan struct{})
 	go func() { store.NewActiveExpirer(engine, 100).Run(expCtx); close(expDone) }()
-	s := New(slog.New(slog.NewTextHandler(io.Discard, nil)), engine)
+	evictor, err := store.NewEvictor(engine, 0, store.NoEviction, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(Options{Engine: engine, Evictor: evictor, Hz: 10})
 	if err := s.Listen("127.0.0.1:0"); err != nil {
 		t.Fatal(err)
 	}
@@ -116,11 +119,11 @@ func TestCommands(t *testing.T) {
 		{"unknown", "*2\r\n$3\r\nFOO\r\n$3\r\nbar\r\n", "-ERR unknown command 'FOO', with args beginning with: 'bar' \r\n"},
 		{"command", "COMMAND\r\n", "*0\r\n"},
 		{"command docs", "COMMAND DOCS\r\n", "*0\r\n"},
-		{"command count", "COMMAND COUNT\r\n", fmt.Sprintf(":%d\r\n", len(New(nil, nil).commands))},
+		{"command count", "COMMAND COUNT\r\n", fmt.Sprintf(":%d\r\n", len(New(Options{}).commands))},
 		{"config get", "CONFIG GET save\r\n", "*2\r\n$4\r\nsave\r\n$0\r\n\r\n"},
 		{"config get glob", "CONFIG GET APPEND*\r\n", "*2\r\n$10\r\nappendonly\r\n$2\r\nno\r\n"},
 		{"config get none", "CONFIG GET nope\r\n", "*0\r\n"},
-		{"config set unsupported", "CONFIG SET a b\r\n", "-ERR unknown subcommand 'SET'. Try CONFIG HELP.\r\n"},
+		{"config set unknown", "CONFIG SET a b\r\n", "-ERR Unknown option or number of arguments for CONFIG SET - 'a'\r\n"},
 		{"command bad sub", "COMMAND NOPE\r\n", "-ERR unknown subcommand 'NOPE'. Try COMMAND HELP.\r\n"},
 	}
 	// All on one connection, in order: also proves a connection stays usable

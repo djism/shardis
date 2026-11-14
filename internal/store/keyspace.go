@@ -15,6 +15,10 @@
 // Expiry (ADR 008, 009): a key with a TTL stores an absolute deadline. Reads
 // delete it lazily once the deadline has passed, and a background loop
 // (expire.go) samples keys with TTLs to clean up the ones nobody reads.
+//
+// Memory (ADR 011, 012, 013): every write and delete updates an estimate of
+// the bytes the data uses (memory.go). With a maxmemory limit, the Evictor
+// (evict.go) frees space before a write by evicting keys by policy.
 package store
 
 import (
@@ -35,6 +39,11 @@ type entry struct {
 	// Absolute rather than "N ms from now" so the deadline means the same
 	// thing after a restart, or when forwarded to a replica (ADR 009).
 	expireAt int64
+
+	// lru is when the key was last used, in Unix seconds. Second resolution
+	// (like Redis's LRU clock) means a hot key is rewritten at most once a
+	// second, not on every read. Approximate LRU eviction compares these.
+	lru uint32
 }
 
 func (e entry) expiredAt(now int64) bool { return e.expireAt != 0 && e.expireAt <= now }
@@ -44,8 +53,8 @@ type keyspace struct {
 	slots [keyslot.Count]map[string]entry
 
 	// volatile[s] holds the keys in slot s that have a TTL. Only the active
-	// expiry loop reads it, to sample keys that might be expired without
-	// wading through the (often much larger) set of keys that never expire.
+	// expiry loop and volatile-ttl eviction read it, to sample keys with a
+	// TTL without wading through the (often much larger) set without one.
 	// Its strings share memory with the keys in slots[s].
 	volatile [keyslot.Count]map[string]struct{}
 
@@ -53,10 +62,14 @@ type keyspace struct {
 	// (vpeak[s] the same for volatile[s]). Go maps never shrink: a map that
 	// once held 1000 keys keeps the memory for 1000 even after 990 are
 	// deleted. The background loop (expire.go) calls compact, which rebuilds
-	// a map smaller once it has fallen below 1/4 of its peak. Doing it there
-	// rather than on every delete means a slot being drained by an expiry
-	// storm is rebuilt once, after it settles, not over and over mid-storm.
+	// a map smaller once it has fallen below 1/4 of its peak (ADR 010).
 	peak, vpeak [keyslot.Count]int32
+
+	mem memoryStats // byte estimate and counters (memory.go)
+
+	// exact is the exact-LRU list, only when the engine was created with
+	// Options.ExactLRU (it costs memory and a global lock; see ADR 012).
+	exact *exactLRU
 }
 
 // Maps smaller than this aren't worth rebuilding.
@@ -101,6 +114,8 @@ type Tx struct {
 // Now is the current time (Unix ms) as seen by this command.
 func (t *Tx) Now() int64 { return t.now }
 
+func (t *Tx) nowSec() uint32 { return uint32(t.now / 1000) }
+
 func (t *Tx) slotOf(key []byte) uint16 {
 	s := keyslot.Of(key)
 	t.checkSlot(s)
@@ -119,20 +134,34 @@ func (t *Tx) requireAll() {
 	}
 }
 
-// lookup finds a live entry, deleting it first if it has expired (lazy expiry).
+// lookup finds a live entry, deleting it first if it has expired (lazy
+// expiry), and records the access for LRU.
 func (t *Tx) lookup(key []byte) (uint16, entry, bool) {
 	s := t.slotOf(key)
-	e, ok := t.ks.slots[s][string(key)] // a nil map reads as empty
-	if ok && e.expiredAt(t.now) {
+	m := t.ks.slots[s]
+	e, ok := m[string(key)] // a nil map reads as empty
+	if !ok {
+		return s, entry{}, false
+	}
+	if e.expiredAt(t.now) {
 		t.expire(s, string(key), "lazy")
 		return s, entry{}, false
 	}
-	return s, e, ok
+	if sec := t.nowSec(); e.lru != sec { // at most one map write per key per second
+		e.lru = sec
+		m[string(key)] = e
+	}
+	if t.ks.exact != nil {
+		t.ks.exact.touch(string(key), s)
+	}
+	return s, e, true
 }
 
-// Get returns the value for key. The returned slice must not be modified.
+// Get returns the value for key and counts a hit or miss (INFO keyspace_hits).
+// The returned slice must not be modified.
 func (t *Tx) Get(key []byte) ([]byte, bool) {
-	_, e, ok := t.lookup(key)
+	s, e, ok := t.lookup(key)
+	t.ks.mem.countLookup(s, ok)
 	return e.val, ok
 }
 
@@ -166,10 +195,20 @@ func (t *Tx) SetWithExpire(key, val []byte, at int64) {
 		m = make(map[string]entry)
 		t.ks.slots[s] = m
 	}
-	k := string(key) // one allocation, shared by both maps
-	m[k] = entry{val: val, expireAt: at}
-	t.ks.peak[s] = max(t.ks.peak[s], int32(len(m)))
+	k := string(key) // one allocation, shared by the maps that index it
+	if old, existed := m[k]; existed {
+		t.ks.mem.add(-t.ks.entrySize(k, old))
+	}
+	e := entry{val: val, expireAt: at, lru: t.nowSec()}
+	m[k] = e
+	t.ks.mem.add(t.ks.entrySize(k, e))
+	if n := int32(len(m)); n > t.ks.peak[s] {
+		t.ks.setPeak(s, n)
+	}
 	t.setVolatile(s, k, at != 0)
+	if t.ks.exact != nil {
+		t.ks.exact.touch(k, s)
+	}
 	t.emitWrite("set", key, s)
 }
 
@@ -187,8 +226,10 @@ func (t *Tx) SetExpire(key []byte, at int64) bool {
 		t.emitWrite("del", key, s)
 		return true
 	}
+	t.ks.mem.add(-t.ks.entrySize(k, e))
 	e.expireAt = at
 	t.ks.slots[s][k] = e
+	t.ks.mem.add(t.ks.entrySize(k, e))
 	t.setVolatile(s, k, at != 0)
 	return true
 }
@@ -210,25 +251,51 @@ func (t *Tx) Delete(key []byte) bool {
 // to send a DEL.
 func (t *Tx) expire(s uint16, k string, how string) {
 	t.remove(s, k)
+	t.ks.mem.expired.Add(1)
 	if t.bus.Active() {
 		t.bus.Emit("expire", map[string]any{"key": k, "slot": s, "how": how})
 	}
 }
 
+// evict removes k from slot s to free memory, if it's still there. Like
+// expire, it's a single choke point that replication will hook into.
+func (t *Tx) evict(s uint16, k string, policy Policy) bool {
+	t.checkSlot(s)
+	if _, ok := t.ks.slots[s][k]; !ok {
+		return false // deleted since it was sampled
+	}
+	t.remove(s, k)
+	t.ks.mem.evicted.Add(1)
+	if t.bus.Active() {
+		t.bus.Emit("evict", map[string]any{"key": k, "slot": s, "policy": policy.String()})
+	}
+	return true
+}
+
 func (t *Tx) remove(s uint16, k string) {
 	m := t.ks.slots[s]
+	if e, ok := m[k]; ok {
+		t.ks.mem.add(-t.ks.entrySize(k, e))
+	}
 	delete(m, k)
 	if len(m) == 0 { // cheap and always worth it; partial shrinking waits for compact
-		t.ks.slots[s], t.ks.peak[s] = nil, 0
+		t.ks.slots[s] = nil
+		t.ks.setPeak(s, 0)
 	}
 	t.setVolatile(s, k, false)
+	if t.ks.exact != nil {
+		t.ks.exact.remove(k)
+	}
 }
 
 // compact rebuilds slot s's maps if they've become mostly empty space.
 func (t *Tx) compact(s uint16) {
 	t.checkSlot(s)
-	t.ks.slots[s], t.ks.peak[s] = shrunk(t.ks.slots[s], t.ks.peak[s])
-	t.ks.volatile[s], t.ks.vpeak[s] = shrunk(t.ks.volatile[s], t.ks.vpeak[s])
+	var p int32
+	t.ks.slots[s], p = shrunk(t.ks.slots[s], t.ks.peak[s])
+	t.ks.setPeak(s, p)
+	t.ks.volatile[s], p = shrunk(t.ks.volatile[s], t.ks.vpeak[s])
+	t.ks.setVPeak(s, p)
 }
 
 func (t *Tx) setVolatile(s uint16, k string, on bool) {
@@ -239,13 +306,16 @@ func (t *Tx) setVolatile(s uint16, k string, on bool) {
 			t.ks.volatile[s] = vm
 		}
 		vm[k] = struct{}{}
-		t.ks.vpeak[s] = max(t.ks.vpeak[s], int32(len(vm)))
+		if n := int32(len(vm)); n > t.ks.vpeak[s] {
+			t.ks.setVPeak(s, n)
+		}
 		return
 	}
 	if vm != nil {
 		delete(vm, k)
 		if len(vm) == 0 {
-			t.ks.volatile[s], t.ks.vpeak[s] = nil, 0
+			t.ks.volatile[s] = nil
+			t.ks.setVPeak(s, 0)
 		}
 	}
 }
@@ -256,6 +326,16 @@ func (t *Tx) Len() int {
 	t.requireAll()
 	n := 0
 	for _, m := range t.ks.slots {
+		n += len(m)
+	}
+	return n
+}
+
+// LenVolatile counts keys that have a TTL. Needs DoAll.
+func (t *Tx) LenVolatile() int {
+	t.requireAll()
+	n := 0
+	for _, m := range t.ks.volatile {
 		n += len(m)
 	}
 	return n
@@ -301,6 +381,10 @@ func (t *Tx) Flush() {
 	for i := range t.ks.slots {
 		t.ks.slots[i], t.ks.peak[i] = nil, 0
 		t.ks.volatile[i], t.ks.vpeak[i] = nil, 0
+	}
+	t.ks.mem.used.Store(0)
+	if t.ks.exact != nil {
+		t.ks.exact.reset()
 	}
 	if t.bus.Active() {
 		t.bus.Emit("flushall", nil)

@@ -31,6 +31,13 @@ type Config struct {
 	// Hz is how many active-expiry cycles run per second (Redis's "hz",
 	// default 10). Higher = expired keys are freed sooner, at more CPU cost.
 	Hz int
+
+	// Memory limit (ADR 011-013). MaxMemory 0 = unlimited. Policy names are
+	// Redis's (noeviction, allkeys-lru, allkeys-random, volatile-ttl), plus
+	// allkeys-lru-exact, which exists only for the ADR 012 comparison.
+	MaxMemory        int64
+	MaxMemoryPolicy  string
+	MaxMemorySamples int
 }
 
 // Load builds a Config from args (usually os.Args[1:]) and getenv (usually os.Getenv).
@@ -50,12 +57,22 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if err := integer(fs, getenv, &cfg.Hz, "hz", 10, "active expiry cycles per second (1-500)"); err != nil {
 		return Config{}, err
 	}
+	var maxmem string
+	str(fs, getenv, &maxmem, "maxmemory", "0", "memory limit, e.g. 100mb or 2gb (0 = none)")
+	str(fs, getenv, &cfg.MaxMemoryPolicy, "maxmemory-policy", "noeviction", "what to do when full: noeviction, allkeys-lru, allkeys-random, volatile-ttl")
+	if err := integer(fs, getenv, &cfg.MaxMemorySamples, "maxmemory-samples", 5, "keys sampled per eviction (approximate LRU / TTL)"); err != nil {
+		return Config{}, err
+	}
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
 	if cfg.Port < 1 || cfg.Port > 55535 {
 		// 55535 because the cluster bus port (Port+10000) must still fit in 65535.
 		return Config{}, fmt.Errorf("port %d out of range 1-55535", cfg.Port)
+	}
+	var err error
+	if cfg.MaxMemory, err = ParseMemory(maxmem); err != nil {
+		return Config{}, err
 	}
 	if cfg.Hz < 1 || cfg.Hz > 500 { // Redis's allowed range
 		return Config{}, fmt.Errorf("hz %d out of range 1-500", cfg.Hz)

@@ -28,7 +28,7 @@ var requestPool = sync.Pool{New: func() any { return &request{done: make(chan st
 
 func newExecutor(opts Options) *executor {
 	e := &executor{
-		tx:    Tx{ks: new(keyspace), bus: opts.Bus},
+		tx:    Tx{ks: opts.newKeyspace(), bus: opts.Bus},
 		clock: opts.clock(),
 		// Buffered so many connections can queue work without each one
 		// waiting for the executor to pick it up individually.
@@ -70,4 +70,6 @@ func (e *executor) Close() {
 	<-e.done
 }
 
-func (e *executor) Name() string { return EngineExecutor }
+func (e *executor) Name() string        { return EngineExecutor }
+func (e *executor) Stats() Stats        { return e.tx.ks.stats() }
+func (e *executor) keyspace() *keyspace { return e.tx.ks }

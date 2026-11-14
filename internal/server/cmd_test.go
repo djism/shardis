@@ -207,10 +207,29 @@ type commandCase = struct {
 	want string
 }
 
+// configCases also run against real Redis: same names, same defaults, same
+// size parsing ("100mb" = 104857600).
+var configCases = []commandCase{
+	{[]string{"CONFIG", "GET", "maxmemory"}, `["maxmemory" "0"]`},
+	{[]string{"CONFIG", "GET", "maxmemory-policy"}, `["maxmemory-policy" "noeviction"]`},
+	{[]string{"CONFIG", "GET", "maxmemory-samples"}, `["maxmemory-samples" "5"]`},
+	{[]string{"CONFIG", "GET", "hz"}, `["hz" "10"]`},
+	{[]string{"CONFIG", "SET", "maxmemory", "100mb"}, "OK"},
+	{[]string{"CONFIG", "GET", "maxmemory"}, `["maxmemory" "104857600"]`},
+	{[]string{"CONFIG", "SET", "maxmemory", "1gb", "maxmemory-policy", "allkeys-lru"}, "OK"},
+	{[]string{"CONFIG", "GET", "maxmemory"}, `["maxmemory" "1073741824"]`},
+	{[]string{"CONFIG", "GET", "maxmemory-policy"}, `["maxmemory-policy" "allkeys-lru"]`},
+	{[]string{"CONFIG", "SET", "maxmemory-policy", "VOLATILE-TTL"}, "OK"},
+	{[]string{"CONFIG", "GET", "maxmemory-policy"}, `["maxmemory-policy" "volatile-ttl"]`},
+	{[]string{"CONFIG", "SET", "maxmemory", "0", "maxmemory-policy", "noeviction"}, "OK"},
+	{[]string{"CONFIG", "SET", "maxmemory"}, "ERR wrong number of arguments for 'config|set' command"},
+}
+
 func checkCases(t *testing.T, c *testClient, label string) {
 	t.Helper()
 	runCases(t, c, label, commandCases)
 	runCases(t, c, label, expiryCases)
+	runCases(t, c, label, configCases)
 }
 
 func runCases(t *testing.T, c *testClient, label string, cases []commandCase) {
@@ -468,6 +487,105 @@ func TestUnreadKeysAreCleanedUpInBackground(t *testing.T) {
 		}
 		if got := c.do("GET", "keeper"); got != `"v"` {
 			t.Fatalf("persistent key affected: %s", got)
+		}
+	})
+}
+
+// parseInfo turns an INFO reply into field → value.
+func parseInfo(t *testing.T, raw string) map[string]string {
+	t.Helper()
+	s, err := strconv.Unquote(raw)
+	if err != nil {
+		t.Fatalf("INFO reply %q is not a bulk string", raw)
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(s, "\r\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok && !strings.HasPrefix(line, "#") {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func infoInt(t *testing.T, info map[string]string, field string) int64 {
+	t.Helper()
+	n, err := strconv.ParseInt(info[field], 10, 64)
+	if err != nil {
+		t.Fatalf("INFO %s = %q", field, info[field])
+	}
+	return n
+}
+
+func TestInfo(t *testing.T) {
+	addr, _ := startServer(t)
+	c := newClient(t, addr)
+	c.do("SET", "a", "1")
+	c.do("SET", "b", "2", "EX", "100")
+	c.do("GET", "a")
+	c.do("GET", "nope")
+	all := parseInfo(t, c.do("INFO"))
+	for _, f := range []string{"redis_version", "tcp_port", "connected_clients", "used_memory", "maxmemory_policy", "keyspace_hits", "evicted_keys"} {
+		if _, ok := all[f]; !ok {
+			t.Errorf("INFO missing %s", f)
+		}
+	}
+	if all["db0"] != "keys=2,expires=1,avg_ttl=0" {
+		t.Errorf("db0 = %q", all["db0"])
+	}
+	if infoInt(t, all, "keyspace_hits") != 1 || infoInt(t, all, "keyspace_misses") != 1 {
+		t.Errorf("hits/misses = %s/%s", all["keyspace_hits"], all["keyspace_misses"])
+	}
+	if infoInt(t, all, "total_commands_processed") < 5 {
+		t.Errorf("total_commands_processed = %s", all["total_commands_processed"])
+	}
+	mem := parseInfo(t, c.do("INFO", "memory"))
+	if _, ok := mem["keyspace_hits"]; ok {
+		t.Error("INFO memory included the stats section")
+	}
+	if infoInt(t, mem, "used_memory") <= 0 {
+		t.Error("used_memory should be positive with keys stored")
+	}
+}
+
+// The whole memory-limit story over the network: refuse writes when full
+// (noeviction), keep reads and DEL working, then switch policy at runtime
+// and watch eviction keep memory at the limit.
+func TestMaxMemoryOverTheNetwork(t *testing.T) {
+	forEachEngine(t, func(t *testing.T, addr string) {
+		c := newClient(t, addr)
+		const limit = 16 << 20
+		if got := c.do("CONFIG", "SET", "maxmemory", "16mb"); got != "OK" {
+			t.Fatal(got)
+		}
+		val := strings.Repeat("x", 1000)
+		i, reply := 0, ""
+		for ; i < 100000; i++ {
+			if reply = c.do("SET", fmt.Sprint("k:", i), val); reply != "OK" {
+				break
+			}
+		}
+		if reply != "OOM command not allowed when used memory > 'maxmemory'." {
+			t.Fatalf("after %d writes got %q, want the OOM error", i, reply)
+		}
+		if got := c.do("GET", "k:0"); got != strconv.Quote(val) {
+			t.Fatalf("GET when full = %.20s", got)
+		}
+		if got := c.do("DEL", "k:0", "k:1"); got != "(int) 2" {
+			t.Fatalf("DEL when full = %s", got)
+		}
+
+		c.do("CONFIG", "SET", "maxmemory-policy", "allkeys-lru")
+		for j := i; j < i+20000; j++ {
+			if got := c.do("SET", fmt.Sprint("k:", j), val); got != "OK" {
+				t.Fatalf("SET with allkeys-lru = %s", got)
+			}
+		}
+		info := parseInfo(t, c.do("INFO"))
+		if infoInt(t, info, "evicted_keys") == 0 {
+			t.Fatal("no keys evicted")
+		}
+		if used := infoInt(t, info, "used_memory"); used > limit+64<<10 {
+			t.Fatalf("used_memory %d over the %d limit", used, limit)
 		}
 	})
 }

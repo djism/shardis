@@ -196,29 +196,43 @@ func (r *Reader) readValue(depth int) (Value, error) {
 	}
 }
 
-// readBulkBody reads exactly size bytes plus the trailing \r\n.
+// readBulkBody reads exactly size bytes plus the trailing \r\n. The
+// returned slice is allocated at exactly size bytes (the CRLF is read
+// separately), because the store keeps these slices as values and counts
+// their memory (store/memory.go).
 func (r *Reader) readBulkBody(size int64) ([]byte, error) {
 	var buf []byte
 	if size <= eagerAllocLimit {
-		buf = make([]byte, size+2)
+		buf = make([]byte, size)
 		if _, err := io.ReadFull(r.br, buf); err != nil {
 			return nil, unexpected(err)
 		}
 	} else {
-		// Grow as data arrives instead of trusting the header.
-		var err error
-		buf, err = io.ReadAll(io.LimitReader(r.br, size+2))
+		// Grow as data arrives instead of trusting the header, then copy
+		// into an exact-size slice (ReadAll leaves spare capacity).
+		got, err := io.ReadAll(io.LimitReader(r.br, size))
 		if err != nil {
 			return nil, unexpected(err)
 		}
-		if int64(len(buf)) < size+2 {
+		if int64(len(got)) < size {
 			return nil, io.ErrUnexpectedEOF
 		}
+		buf = append(make([]byte, 0, size), got...)
 	}
-	if buf[size] != '\r' || buf[size+1] != '\n' {
+	// ReadByte, not ReadFull into a small array: passing the array to an
+	// io.Reader makes it escape to the heap (+1 allocation per argument).
+	cr, err := r.br.ReadByte()
+	if err != nil {
+		return nil, unexpected(err)
+	}
+	lf, err := r.br.ReadByte()
+	if err != nil {
+		return nil, unexpected(err)
+	}
+	if cr != '\r' || lf != '\n' {
 		return nil, protoErr("bulk string not terminated by CRLF")
 	}
-	return buf[:size:size], nil
+	return buf, nil
 }
 
 // readHeader reads a "<type byte><text>\r\n" line and returns it without the

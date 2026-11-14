@@ -37,13 +37,15 @@ type paddedMutex struct {
 //     the other), so we always lock in ascending shard order.
 //   - A command must lock every key it touches. Tx panics if it doesn't.
 type sharded struct {
-	ks    keyspace
+	ks    *keyspace
 	bus   *events.Bus
 	clock func() int64
 	locks [numShards]paddedMutex
 }
 
-func newSharded(opts Options) *sharded { return &sharded{bus: opts.Bus, clock: opts.clock()} }
+func newSharded(opts Options) *sharded {
+	return &sharded{ks: opts.newKeyspace(), bus: opts.Bus, clock: opts.clock()}
+}
 
 func (s *sharded) Do(keys [][]byte, fn func(*Tx)) {
 	var set shardSet
@@ -52,7 +54,7 @@ func (s *sharded) Do(keys [][]byte, fn func(*Tx)) {
 	}
 	s.lockSet(&set)
 	defer s.unlockSet(&set)
-	tx := Tx{ks: &s.ks, bus: s.bus, now: s.clock(), locked: &set}
+	tx := Tx{ks: s.ks, bus: s.bus, now: s.clock(), locked: &set}
 	fn(&tx)
 }
 
@@ -61,7 +63,7 @@ func (s *sharded) DoGroup(g int, fn func(*Tx, []uint16)) {
 	set.add(g)
 	s.locks[g].Lock()
 	defer s.locks[g].Unlock()
-	tx := Tx{ks: &s.ks, bus: s.bus, now: s.clock(), locked: &set}
+	tx := Tx{ks: s.ks, bus: s.bus, now: s.clock(), locked: &set}
 	fn(&tx, groupSlots[g])
 }
 
@@ -74,7 +76,7 @@ func (s *sharded) DoAll(fn func(*Tx)) {
 			s.locks[i].Unlock()
 		}
 	}()
-	tx := Tx{ks: &s.ks, bus: s.bus, now: s.clock()}
+	tx := Tx{ks: s.ks, bus: s.bus, now: s.clock()}
 	fn(&tx)
 }
 
@@ -100,5 +102,7 @@ func (s *sharded) unlockSet(set *shardSet) {
 	}
 }
 
-func (s *sharded) Close()       {}
-func (s *sharded) Name() string { return EngineSharded }
+func (s *sharded) Close()              {}
+func (s *sharded) Name() string        { return EngineSharded }
+func (s *sharded) Stats() Stats        { return s.ks.stats() }
+func (s *sharded) keyspace() *keyspace { return s.ks }

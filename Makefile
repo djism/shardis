@@ -4,16 +4,20 @@ PKG     := ./...
 GOFILES := $(shell find . -name '*.go' -not -path './website/*')
 
 .DEFAULT_GOAL := help
-.PHONY: help build test fuzz bench run fmt vet lint clean cluster-up cluster-down
+.PHONY: help build test test-memory fuzz bench run fmt vet lint clean cluster-up cluster-down
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
 
 build: ## build binaries into bin/
 	go build -o $(BIN) ./cmd/shardis
+	go build -o bin/shardis-loadgen ./cmd/shardis-loadgen
 
 test: ## run all tests with the race detector
 	go test -race -count=1 $(PKG)
+
+test-memory: ## heap-measuring tests (skipped under -race in `make test`)
+	go test -count=1 -run 'Memory' ./internal/store
 
 fuzz: ## fuzz the RESP parser (FUZZTIME=60s per target)
 	@for f in FuzzReadCommand FuzzReadValue FuzzCommandRoundTrip; do \
@@ -35,7 +39,7 @@ lint: vet ## fail if any file is not gofmt-formatted
 	@out=$$(gofmt -l $(GOFILES)); if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
 
 clean: ## remove build output
-	rm -f $(BIN)
+	rm -f $(BIN) bin/shardis-loadgen
 
 cluster-up: ## 6-node cluster with docker compose (Iteration 7)
 	@echo "cluster-up arrives in Iteration 7 (deploy/compose)"

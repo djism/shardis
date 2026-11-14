@@ -27,6 +27,10 @@ type Engine interface {
 	// Close stops the engine. No calls may happen after it.
 	Close()
 	Name() string
+	// Stats returns memory and hit/miss counters. Safe to call any time.
+	Stats() Stats
+
+	keyspace() *keyspace // for the Evictor, which lives in this package
 }
 
 // Options configures an engine. The zero value is valid.
@@ -35,6 +39,18 @@ type Options struct {
 	// Clock returns the current time in Unix milliseconds. Tests swap in a
 	// fake clock so they can jump time forward instead of sleeping.
 	Clock func() int64
+	// ExactLRU keeps an exact LRU list of every key, needed for the
+	// allkeys-lru-exact policy. Costs ~112 bytes per key and a global lock
+	// on every access (ADR 012); off by default.
+	ExactLRU bool
+}
+
+func (o Options) newKeyspace() *keyspace {
+	ks := new(keyspace)
+	if o.ExactLRU {
+		ks.exact = newExactLRU()
+	}
+	return ks
 }
 
 func (o Options) clock() func() int64 {

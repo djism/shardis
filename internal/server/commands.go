@@ -3,8 +3,6 @@ package server
 import (
 	"fmt"
 	"strings"
-
-	"github.com/djism/shardis/internal/store"
 )
 
 // command describes one command the server understands.
@@ -12,8 +10,23 @@ type command struct {
 	// arity uses Redis's convention, counting the command name itself:
 	// N > 0 means exactly N arguments, N < 0 means at least -N.
 	arity int
+	flags cmdFlags
 	run   func(cl *client, args [][]byte)
 }
+
+// Command flags, the same idea as Redis's command flags.
+type cmdFlags uint8
+
+const (
+	// flagWrite: changes data. Replicas will refuse these (Iteration 6).
+	flagWrite cmdFlags = 1 << iota
+	// flagDenyOOM: may grow memory, so it's refused when memory is full and
+	// nothing can be evicted. DEL is a write but not denyoom: deleting is
+	// how you get out of an out-of-memory situation.
+	flagDenyOOM
+)
+
+const wd = flagWrite | flagDenyOOM
 
 // commandTable is built per Server (not as a package-level var) because
 // COMMAND COUNT needs to look at the table, and Go forbids a package-level
@@ -26,35 +39,36 @@ func (s *Server) commandTable() map[string]command {
 		"quit":    {arity: -1, run: cmdQuit},
 		"command": {arity: -1, run: cmdCommand},
 		"config":  {arity: -2, run: cmdConfig},
+		"info":    {arity: -1, run: cmdInfo},
 
 		// strings (cmd_strings.go)
 		"get":    {arity: 2, run: cmdGet},
-		"set":    {arity: -3, run: cmdSet},
+		"set":    {arity: -3, flags: wd, run: cmdSet},
 		"mget":   {arity: -2, run: cmdMGet},
-		"mset":   {arity: -3, run: cmdMSet},
-		"incr":   {arity: 2, run: cmdIncr},
-		"decr":   {arity: 2, run: cmdDecr},
-		"incrby": {arity: 3, run: cmdIncrBy},
-		"decrby": {arity: 3, run: cmdDecrBy},
+		"mset":   {arity: -3, flags: wd, run: cmdMSet},
+		"incr":   {arity: 2, flags: wd, run: cmdIncr},
+		"decr":   {arity: 2, flags: wd, run: cmdDecr},
+		"incrby": {arity: 3, flags: wd, run: cmdIncrBy},
+		"decrby": {arity: 3, flags: wd, run: cmdDecrBy},
 
 		// keyspace (cmd_keys.go)
-		"del":      {arity: -2, run: cmdDel},
+		"del":      {arity: -2, flags: flagWrite, run: cmdDel},
 		"exists":   {arity: -2, run: cmdExists},
 		"keys":     {arity: 2, run: cmdKeys},
 		"scan":     {arity: -2, run: cmdScan},
 		"dbsize":   {arity: 1, run: cmdDBSize},
-		"flushall": {arity: -1, run: cmdFlushAll},
+		"flushall": {arity: -1, flags: flagWrite, run: cmdFlushAll},
 
 		// expiry (cmd_expire.go)
-		"expire":      {arity: -3, run: expireCommand("expire", 1000, false)},
-		"pexpire":     {arity: -3, run: expireCommand("pexpire", 1, false)},
-		"expireat":    {arity: -3, run: expireCommand("expireat", 1000, true)},
-		"pexpireat":   {arity: -3, run: expireCommand("pexpireat", 1, true)},
+		"expire":      {arity: -3, flags: flagWrite, run: expireCommand("expire", 1000, false)},
+		"pexpire":     {arity: -3, flags: flagWrite, run: expireCommand("pexpire", 1, false)},
+		"expireat":    {arity: -3, flags: flagWrite, run: expireCommand("expireat", 1000, true)},
+		"pexpireat":   {arity: -3, flags: flagWrite, run: expireCommand("pexpireat", 1, true)},
 		"ttl":         {arity: 2, run: ttlCommand(false, false)},
 		"pttl":        {arity: 2, run: ttlCommand(true, false)},
 		"expiretime":  {arity: 2, run: ttlCommand(false, true)},
 		"pexpiretime": {arity: 2, run: ttlCommand(true, true)},
-		"persist":     {arity: 2, run: cmdPersist},
+		"persist":     {arity: 2, flags: flagWrite, run: cmdPersist},
 	}
 }
 
@@ -68,6 +82,16 @@ func (s *Server) dispatch(cl *client, args [][]byte) {
 	if !arityOK(cmd.arity, len(args)) {
 		cl.w.WriteError(fmt.Sprintf("ERR wrong number of arguments for '%s' command", name))
 		return
+	}
+	cl.cmds.Add(1)
+	// Make room *before* the command takes its locks: eviction has to lock
+	// other shards, and doing that while holding this command's locks could
+	// deadlock (ADR 013).
+	if cmd.flags&flagDenyOOM != 0 && s.evictor != nil {
+		if err := s.evictor.Reserve(); err != nil {
+			cl.w.WriteError(err.Error()) // "OOM command not allowed when used memory > 'maxmemory'."
+			return
+		}
 	}
 	cmd.run(cl, args)
 }
@@ -138,36 +162,5 @@ func cmdCommand(cl *client, args [][]byte) {
 		cl.w.WriteInt(int64(len(cl.srv.commands)))
 	default:
 		cl.w.WriteError(fmt.Sprintf("ERR unknown subcommand '%s'. Try COMMAND HELP.", truncate(args[1], 128)))
-	}
-}
-
-// configValues are the settings CONFIG GET can report. They're the truth
-// about this build: there's no persistence yet, so save is "" and
-// appendonly is "no". redis-benchmark reads these two at startup and warns
-// if it can't. CONFIG SET and real tunables arrive with Iteration 4.
-var configValues = [][2]string{
-	{"save", ""},
-	{"appendonly", "no"},
-}
-
-// CONFIG GET pattern [pattern ...] → flat list of name, value pairs.
-func cmdConfig(cl *client, args [][]byte) {
-	if !strings.EqualFold(string(args[1]), "GET") || len(args) < 3 {
-		cl.w.WriteError(fmt.Sprintf("ERR unknown subcommand '%s'. Try CONFIG HELP.", truncate(args[1], 128)))
-		return
-	}
-	var out [][2]string
-	for _, kv := range configValues {
-		for _, pat := range args[2:] {
-			if store.Match(strings.ToLower(string(pat)), kv[0]) {
-				out = append(out, kv)
-				break
-			}
-		}
-	}
-	cl.w.WriteArrayHeader(2 * len(out))
-	for _, kv := range out {
-		cl.w.WriteBulkString(kv[0])
-		cl.w.WriteBulkString(kv[1])
 	}
 }

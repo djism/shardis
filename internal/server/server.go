@@ -12,29 +12,50 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/djism/shardis/internal/resp"
 	"github.com/djism/shardis/internal/store"
 )
 
+// Options configures a Server. Engine is required.
+type Options struct {
+	Log     *slog.Logger   // nil = discard
+	Engine  store.Engine   // the caller owns it and closes it after Serve returns
+	Evictor *store.Evictor // nil = no memory limit
+	Hz      int            // for INFO and CONFIG GET hz
+}
+
 type Server struct {
 	log      *slog.Logger
 	engine   store.Engine
+	evictor  *store.Evictor
+	hz       int
 	commands map[string]command
+	started  time.Time
 
 	ln net.Listener
 
 	mu      sync.Mutex
-	conns   map[net.Conn]struct{} // open connections, so shutdown can close them
+	conns   map[net.Conn]*client // open connections (client set once its goroutine starts)
 	closing bool
 
 	wg sync.WaitGroup // one per connection goroutine
+
+	connsTotal atomic.Int64 // connections ever accepted
+	cmdsDone   atomic.Int64 // commands run by connections that have since closed
 }
 
-// New creates a server that runs commands against engine. The caller owns
-// the engine and closes it after Serve returns.
-func New(log *slog.Logger, engine store.Engine) *Server {
-	s := &Server{log: log, engine: engine, conns: make(map[net.Conn]struct{})}
+func New(opts Options) *Server {
+	log := opts.Log
+	if log == nil {
+		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	s := &Server{
+		log: log, engine: opts.Engine, evictor: opts.Evictor, hz: opts.Hz,
+		conns: make(map[net.Conn]*client), started: time.Now(),
+	}
 	s.commands = s.commandTable()
 	return s
 }
@@ -101,15 +122,32 @@ func (s *Server) track(c net.Conn) bool {
 	if s.closing {
 		return false
 	}
-	s.conns[c] = struct{}{}
+	s.conns[c] = nil
+	s.connsTotal.Add(1)
 	return true
 }
 
 func (s *Server) untrack(c net.Conn) {
 	s.mu.Lock()
+	if cl := s.conns[c]; cl != nil {
+		s.cmdsDone.Add(cl.cmds.Load())
+	}
 	delete(s.conns, c)
 	s.mu.Unlock()
 	c.Close()
+}
+
+// clientStats returns the number of open connections and commands run so far.
+func (s *Server) clientStats() (open int, commands int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	commands = s.cmdsDone.Load()
+	for _, cl := range s.conns {
+		if cl != nil {
+			commands += cl.cmds.Load()
+		}
+	}
+	return len(s.conns), commands
 }
 
 // client is per-connection state that command handlers can see.
@@ -117,6 +155,11 @@ type client struct {
 	srv  *Server
 	w    *resp.Writer
 	quit bool // set by QUIT: flush the reply, then hang up
+
+	// cmds counts this connection's commands. Per connection rather than one
+	// server-wide counter, so 10 cores running commands don't all fight over
+	// the same memory. INFO adds them up.
+	cmds atomic.Int64
 }
 
 func (s *Server) handle(c net.Conn) {
@@ -130,6 +173,9 @@ func (s *Server) handle(c net.Conn) {
 	// (see flushBeforeRead), so a pipelined batch gets one write syscall.
 	r := resp.NewReader(flushBeforeRead{conn: c, w: w})
 	cl := &client{srv: s, w: w}
+	s.mu.Lock()
+	s.conns[c] = cl
+	s.mu.Unlock()
 
 	for {
 		args, err := r.ReadCommand()

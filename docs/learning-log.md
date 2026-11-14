@@ -308,3 +308,83 @@ add a background compaction step. Without it, 95k surviving keys were holding 10
 
 2. We store "expires at 12:00:05" instead of "expires in 5 seconds". What breaks with the relative version once we add replication?
 <details><summary>Answer</summary>The replica gets the write a bit later (replication lag), or replays it from a log after a restart. With "5 seconds from now", each copy starts its own countdown when it *receives* the write, so the replica would keep the key alive longer than the primary, and a restart would extend every TTL. An absolute deadline means the same moment everywhere.</details>
+
+## Iteration 4: Memory limits + eviction
+
+**What we built**
+`--maxmemory` with four Redis policies (`noeviction`, `allkeys-lru`, `allkeys-random`,
+`volatile-ttl`), adjustable at runtime with `CONFIG SET`, plus `INFO` (memory, stats, keyspace).
+Memory is tracked by an estimate that lands within 1–3% of the real Go heap. We built a load
+generator that simulates an app with skewed traffic, and showed that Redis-style *approximate* LRU
+is within 0.4 points of *exact* LRU while using less memory and being 5x faster to read.
+
+**How it works**
+```
+SET k v ──► over maxmemory?  no  ──────────────────────────────► run SET
+                │ yes
+                ├─ noeviction ─────► -OOM command not allowed...   (GET and DEL still work)
+                └─ evict until under the limit, one shard lock at a time:
+                     allkeys-lru:    sample 5 random keys → pool of the 16 oldest → evict oldest
+                     allkeys-random: sample 1 key → evict it
+                     volatile-ttl:   sample keys with a TTL → evict the soonest-expiring
+                   ...then run SET
+```
+- **How we know the memory used:** every write and delete adds or subtracts what that key costs.
+  That's its key and value rounded to Go's allocation sizes, plus the slot maps, whose size we
+  can work out because Go maps double and never shrink.
+- **Why evict before locking:** eviction has to touch whichever shard holds the victim. Doing it
+  while holding this command's locks could deadlock with another command doing the same thing.
+- **Last-used time** has 1-second resolution, so a hot key's timestamp is rewritten at most once a
+  second, not on every read.
+
+**Why we did it this way**
+- *An estimate, not the Go heap (ADR 011).* Reading the heap is slow and includes uncollected
+  garbage, so it sawtooths. Our estimate costs one atomic add per write and matches real heap
+  growth within 1–3% from 20k to 1M keys. The first version was off by **2x** for small keyspaces
+  because it ignored the 16,384 mostly-empty slot maps.
+- *Approximate LRU (ADR 012).* Exact LRU makes every GET move a node in one shared list behind one
+  lock: 5x slower at 10 cores, and ~107 extra bytes per key. With the same memory it fits 26% fewer
+  keys and loses to approximate LRU (74.6% vs 77.2%).
+- *Synchronous eviction before locking (ADR 013).* The limit holds within one write, and deadlock
+  is impossible by construction.
+
+**What can go wrong**
+- **Memory floor of ~9 MB.** The 16,384 slot maps cost that once keys spread over every slot (up
+  to ~14 MB with TTLs). Below ~10 MB of `maxmemory`, eviction has to empty whole slots to free
+  their maps, which kills LRU's quality. Our first eviction tests used a 400 KB limit and LRU
+  "kept" 0 of 200 hot keys. Startup now warns below 32 MB.
+- **~1.7x Redis's memory per key** (322 vs 188 B for a 100-byte value).
+- **The estimate is not RSS.** Go heap runs ~20% above it between GCs, and RSS above that. Give a
+  container's limit headroom above `maxmemory`.
+- **Writes pay for eviction when full**, and writers line up behind one eviction lock under memory
+  pressure. One write (or one per concurrent writer) can land over the limit.
+
+**Try it yourself**
+```
+make build
+./bin/shardis --maxmemory 64mb --maxmemory-policy allkeys-lru
+./bin/shardis-loadgen -addr 127.0.0.1:7000 -keys 1000000 -warmup 25s -duration 20s
+redis-cli -p 7000 info memory                   # used_memory vs maxmemory, go heap next to it
+redis-cli -p 7000 info stats                    # keyspace_hits/misses, evicted_keys
+redis-cli -p 7000 config set maxmemory-policy noeviction
+redis-cli -p 7000 set x y                       # (error) OOM command not allowed when used memory > 'maxmemory'.
+redis-cli -p 7000 config set maxmemory-policy allkeys-random   # rerun loadgen, compare hit rate
+bash docs/benchmarks/iter-04-eviction/run.sh    # the full comparison vs Redis (~8 min)
+```
+
+**Interview question you can now answer**
+*"How would you implement LRU eviction for a cache with millions of keys under heavy concurrency?"*
+"Not with a linked list. Exact LRU turns every read into a write to one shared structure. I built
+it to check, and at 10 cores reads got 5x slower and adding cores made it worse. It also costs
+about 107 bytes per key, so with the same memory it fit 26% fewer keys and ended up with a worse
+hit rate than the approximation. I do what Redis does: each key stores a last-used timestamp at
+one-second resolution. To evict, sample 5 random keys into a pool of the 16 best candidates and
+evict the oldest. On a Zipf workload that's 77.2% hit rate vs 77.6% for exact LRU and 73.7% for
+random. I also evict before the write takes its locks, so eviction can't deadlock with commands."
+
+**Check yourself**
+1. Exact LRU picks the truly oldest key every time, yet with the same 32 MB it got a *lower* hit rate than approximate LRU. Why?
+<details><summary>Answer</summary>Its bookkeeping takes memory: a list node and an index entry, ~107 bytes per key. In the same 32 MB it held 77k keys instead of 104k. Hit rate depends mostly on how many keys fit, so picking the perfect victim couldn't make up for 26% less cache. It only caught up when given 33% more memory.</details>
+
+2. Why does the memory estimate track each slot map's *peak* size instead of its current size?
+<details><summary>Answer</summary>Go maps grow by doubling and never shrink. A map that once held 60 keys keeps its 128-slot array even after 55 are deleted. So the memory a map really uses follows from the most it has ever held, until compaction rebuilds it smaller. Using the current size would undercount, and eviction would let real memory blow past the limit.</details>
