@@ -88,10 +88,7 @@ func forEachEngine(t *testing.T, test func(t *testing.T, addr string)) {
 // commandCases are run in order on one connection. They're also replayed
 // against real Redis in TestMatchesRealRedis, so the expected strings below
 // are what Redis 8 actually returns.
-var commandCases = []struct {
-	args []string
-	want string
-}{
+var commandCases = []commandCase{
 	{[]string{"GET", "k"}, "(nil)"},
 	{[]string{"SET", "k", "v"}, "OK"},
 	{[]string{"GET", "k"}, `"v"`},
@@ -136,20 +133,112 @@ var commandCases = []struct {
 	{[]string{"DBSIZE"}, "(int) 0"},
 }
 
+// expiryCases cover TTLs. Like commandCases they also run against real
+// Redis. A want of "~(int) N" means "an integer within 1000 of N", for PTTL,
+// which ticks down while the test runs. 4102444800 is 2100-01-01 in Unix seconds.
+var expiryCases = []commandCase{
+	{[]string{"SET", "t", "v", "EX", "100"}, "OK"},
+	{[]string{"TTL", "t"}, "(int) 100"},
+	{[]string{"PTTL", "t"}, "~(int) 100000"},
+	{[]string{"SET", "t", "v2"}, "OK"}, // plain SET drops the TTL
+	{[]string{"TTL", "t"}, "(int) -1"},
+	{[]string{"TTL", "nope"}, "(int) -2"},
+	{[]string{"PTTL", "nope"}, "(int) -2"},
+	{[]string{"SET", "c", "5", "PX", "100000"}, "OK"},
+	{[]string{"INCR", "c"}, "(int) 6"},
+	{[]string{"TTL", "c"}, "(int) 100"}, // INCR keeps it
+	{[]string{"SET", "t", "v", "EX", "50"}, "OK"},
+	{[]string{"SET", "t", "v3", "KEEPTTL"}, "OK"},
+	{[]string{"TTL", "t"}, "(int) 50"},
+	{[]string{"GET", "t"}, `"v3"`},
+	{[]string{"SET", "k", "v", "EX", "0"}, "ERR invalid expire time in 'set' command"},
+	{[]string{"SET", "k", "v", "PX", "-5"}, "ERR invalid expire time in 'set' command"},
+	{[]string{"SET", "k", "v", "EX", "abc"}, errNotInt},
+	{[]string{"SET", "k", "v", "EX", "9223372036854775807"}, "ERR invalid expire time in 'set' command"},
+	{[]string{"SET", "k", "v", "EX", "10", "PX", "100"}, errSyntax},
+	{[]string{"SET", "k", "v", "EX"}, errSyntax},
+	{[]string{"SET", "k", "v", "KEEPTTL", "EX", "10"}, errSyntax},
+	{[]string{"SET", "q", "v", "PXAT", "1"}, "OK"}, // deadline in 1970: born expired
+	{[]string{"GET", "q"}, "(nil)"},
+	{[]string{"SET", "n", "v", "NX", "EX", "100"}, "OK"},
+	{[]string{"TTL", "n"}, "(int) 100"},
+	{[]string{"EXPIREAT", "t", "4102444800"}, "(int) 1"},
+	{[]string{"EXPIRETIME", "t"}, "(int) 4102444800"},
+	{[]string{"PEXPIRETIME", "t"}, "(int) 4102444800000"},
+	{[]string{"EXPIRETIME", "nope"}, "(int) -2"},
+	{[]string{"PERSIST", "t"}, "(int) 1"},
+	{[]string{"PERSIST", "t"}, "(int) 0"},
+	{[]string{"PERSIST", "nope"}, "(int) 0"},
+	{[]string{"EXPIRETIME", "t"}, "(int) -1"},
+	{[]string{"EXPIRE", "nope", "10"}, "(int) 0"},
+	{[]string{"EXPIRE", "t", "100", "XX"}, "(int) 0"}, // no TTL yet
+	{[]string{"EXPIRE", "t", "100", "NX"}, "(int) 1"},
+	{[]string{"EXPIRE", "t", "200", "NX"}, "(int) 0"},
+	{[]string{"EXPIRE", "t", "50", "GT"}, "(int) 0"},
+	{[]string{"EXPIRE", "t", "200", "gt"}, "(int) 1"},
+	{[]string{"EXPIRE", "t", "300", "LT"}, "(int) 0"},
+	{[]string{"EXPIRE", "t", "10", "LT"}, "(int) 1"},
+	{[]string{"TTL", "t"}, "(int) 10"},
+	{[]string{"EXPIRE", "t", "1000", "XX", "GT"}, "(int) 1"}, // has a TTL and 1000s is later
+	{[]string{"TTL", "t"}, "(int) 1000"},
+	{[]string{"EXPIRE", "t", "10", "NX", "XX"}, "ERR NX and XX, GT or LT options at the same time are not compatible"},
+	{[]string{"EXPIRE", "t", "10", "GT", "LT"}, "ERR GT and LT options at the same time are not compatible"},
+	{[]string{"EXPIRE", "t", "10", "BOGUS"}, "ERR Unsupported option BOGUS"},
+	{[]string{"EXPIRE", "t", "x"}, errNotInt},
+	{[]string{"EXPIRE", "t", "9223372036854775807"}, "ERR invalid expire time in 'expire' command"},
+	{[]string{"PEXPIRE", "t", "9223372036854775807"}, "ERR invalid expire time in 'pexpire' command"},
+	{[]string{"PERSIST", "t"}, "(int) 1"},
+	{[]string{"EXPIRE", "t", "100", "GT"}, "(int) 0"}, // no TTL counts as infinite
+	{[]string{"EXPIRE", "t", "100", "LT"}, "(int) 1"},
+	{[]string{"EXPIRE", "t", "0"}, "(int) 1"}, // past deadline: deleted now
+	{[]string{"EXISTS", "t"}, "(int) 0"},
+	{[]string{"SET", "p", "v"}, "OK"},
+	{[]string{"PEXPIRE", "p", "-1"}, "(int) 1"},
+	{[]string{"GET", "p"}, "(nil)"},
+	{[]string{"SET", "a", "v"}, "OK"},
+	{[]string{"EXPIREAT", "a", "0"}, "(int) 1"},
+	{[]string{"EXISTS", "a"}, "(int) 0"},
+	{[]string{"TTL"}, "ERR wrong number of arguments for 'ttl' command"},
+	{[]string{"FLUSHALL"}, "OK"},
+}
+
+type commandCase = struct {
+	args []string
+	want string
+}
+
 func checkCases(t *testing.T, c *testClient, label string) {
 	t.Helper()
-	for _, tc := range commandCases {
+	runCases(t, c, label, commandCases)
+	runCases(t, c, label, expiryCases)
+}
+
+func runCases(t *testing.T, c *testClient, label string, cases []commandCase) {
+	t.Helper()
+	for _, tc := range cases {
 		got := c.do(tc.args...)
-		if tc.args[0] == "KEYS" {
+		switch {
+		case tc.args[0] == "KEYS":
 			if !sameSet(got, `["max" "min"]`) {
 				t.Errorf("%s %v = %s", label, tc.args, got)
 			}
-			continue
-		}
-		if got != tc.want {
+		case strings.HasPrefix(tc.want, "~"):
+			if !closeInt(got, tc.want[1:], 1000) {
+				t.Errorf("%s %v = %s, want about %s", label, tc.args, got, tc.want[1:])
+			}
+		case got != tc.want:
 			t.Errorf("%s %v = %s, want %s", label, tc.args, got, tc.want)
 		}
 	}
+}
+
+func closeInt(got, want string, tolerance int64) bool {
+	var g, w int64
+	if _, err := fmt.Sscanf(got, "(int) %d", &g); err != nil {
+		return false
+	}
+	fmt.Sscanf(want, "(int) %d", &w)
+	return g <= w && g >= w-tolerance
 }
 
 func sameSet(a, b string) bool {
@@ -335,5 +424,50 @@ func TestMSetIsNeverSeenHalfDone(t *testing.T) {
 			})
 		}
 		wg.Wait()
+	})
+}
+
+// Real clock, real network: a key with a 100ms TTL is gone after it passes.
+func TestKeyExpiresOverTheNetwork(t *testing.T) {
+	forEachEngine(t, func(t *testing.T, addr string) {
+		c := newClient(t, addr)
+		if got := c.do("SET", "short", "v", "PX", "100"); got != "OK" {
+			t.Fatal(got)
+		}
+		if got := c.do("GET", "short"); got != `"v"` {
+			t.Fatalf("GET before expiry = %s", got)
+		}
+		time.Sleep(150 * time.Millisecond)
+		if got := c.do("GET", "short"); got != "(nil)" {
+			t.Fatalf("GET after expiry = %s", got)
+		}
+	})
+}
+
+// Keys that are never read must still disappear: only active expiry can
+// remove them. DBSIZE counts stored keys (expired or not), so it only drops
+// to 0 if the background loop deleted them.
+func TestUnreadKeysAreCleanedUpInBackground(t *testing.T) {
+	forEachEngine(t, func(t *testing.T, addr string) {
+		c := newClient(t, addr)
+		var args []string
+		for i := range 2000 {
+			args = append(args, fmt.Sprint("tmp:", i), "x")
+		}
+		c.do(append([]string{"MSET"}, args...)...)
+		for i := range 2000 {
+			c.do("PEXPIRE", fmt.Sprint("tmp:", i), "50")
+		}
+		c.do("SET", "keeper", "v")
+		deadline := time.Now().Add(5 * time.Second)
+		for c.do("DBSIZE") != "(int) 1" {
+			if time.Now().After(deadline) {
+				t.Fatalf("DBSIZE still %s after 5s", c.do("DBSIZE"))
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if got := c.do("GET", "keeper"); got != `"v"` {
+			t.Fatalf("persistent key affected: %s", got)
+		}
 	})
 }

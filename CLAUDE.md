@@ -153,10 +153,12 @@ make fuzz         # fuzz the RESP parser (FUZZTIME=60s per target)
 make bench        # Go microbenchmarks
 make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* env > default)
                   # --engine sharded (default) | executor   (ADR 005)
+                  # --hz 10   active-expiry cycles per second (ADR 008)
 SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
 bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
 bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
 bash docs/benchmarks/iter-02-concurrency/gc.sh    # memory per key + GC pauses with ~1M keys
+bash docs/benchmarks/iter-03-expiry/storm.sh      # 1M-key expiry storm vs Redis (~2 min)
 ```
 
 macOS note: AirPlay Receiver listens on *:7000. Binding 127.0.0.1:7000 (the default) works;

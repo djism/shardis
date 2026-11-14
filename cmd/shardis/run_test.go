@@ -76,6 +76,26 @@ func TestRunServesAndStopsOnCancel(t *testing.T) {
 	}
 }
 
+// If the port is taken, run must return the error, not hang.
+func TestRunReturnsWhenPortBusy(t *testing.T) {
+	port := freePort(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:"+port) // occupy it
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	done := make(chan error, 1)
+	go func() { done <- run(context.Background(), []string{"--port", port}, noEnv) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an address-in-use error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("run hung after Listen failed")
+	}
+}
+
 func TestRunRejectsBadConfig(t *testing.T) {
 	if err := run(context.Background(), []string{"--port", "0"}, noEnv); err == nil {
 		t.Fatal("expected config error")

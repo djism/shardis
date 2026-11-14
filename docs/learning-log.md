@@ -227,3 +227,84 @@ multi-key ops inside one hash slot, which means exactly one lock for me."
 
 2. We measured GC stop-the-world pauses under 0.3 ms with 1M keys. Does that mean GC has no effect on latency?
 <details><summary>Answer</summary>No. Stop-the-world pauses are short, but the GC's marking phase runs *concurrently* and uses about 25% of CPU while it runs, and it can make a busy goroutine help with marking ("mark assist"), which slows that request. GC also explains why we use about 2.3x more memory than live data. Short pauses rule out GC as the cause of 50 ms spikes, not as a cost.</details>
+
+## Iteration 3: Expiry
+
+**What we built**
+Keys can now have a time-to-live: `SET ... EX/PX/EXAT/PXAT/KEEPTTL`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/
+`PEXPIREAT` (with `NX/XX/GT/LT`), `TTL`/`PTTL`/`EXPIRETIME`/`PEXPIRETIME` and `PERSIST`. 63 cases
+replayed against real Redis give identical replies. Expired keys are removed two ways: when someone
+reads them (lazy), and by a background loop that samples keys with TTLs (active). About a million
+keys nobody reads are gone about a second after they expire, and the memory comes back.
+
+**How it works**
+Each key stores an absolute deadline ("dies at 12:00:05.250"). Keys with a TTL are also listed in a
+small per-slot index so the background loop can find them.
+```
+ GET k ──► lookup ──► past deadline? ──yes──► delete now ("lazy"), reply (nil)
+                                     └─no──► reply value
+
+ every 100 ms (hz=10), for each group of slots, holding its lock ≤ 1 ms:
+     sample 20 keys from the TTL index → delete the expired ones
+     > 25% were expired?  yes → sample again (probably lots more)
+                          no  → good enough, next slot
+     slot's map now < 1/4 of its peak size? → rebuild it smaller
+ whole cycle stops after 25 ms (25% of one core, at most)
+```
+The 25% rule makes it self-tuning: when nothing is expiring it glances at each slot once, and in a
+storm it works flat out (within its budget).
+
+**Why we did it this way**
+- *Sampling, not a heap or timers (ADR 008).* A min-heap would delete exactly on time but costs
+  ~40 B per key and O(log n) per update. A timer per key means a million runtime timers. Sampling
+  costs nothing extra and keeps up as well as Redis (0.8–1.2 s vs 1.0–1.2 s after the deadline).
+- *Absolute deadlines (ADR 009).* "Dies in 5 s" would restart its countdown every time the write
+  is replayed or copied to a replica. "Dies at 12:00:05" means the same thing everywhere.
+- *A 1 ms cap per lock.* Redis's single thread can spend a full 25 ms on expiry while clients
+  wait. We hold any one shard lock for at most ~1 ms, so during the storm our GET p99 peaked at
+  ~1–1.7 ms vs Redis's ~1.7–3.4 ms.
+- *A fake clock in tests.* "Wait 2 seconds" becomes `clk.Advance(2*time.Second)`: instant and the
+  same every run, instead of sleeping and hoping.
+
+**What can go wrong**
+- **Go maps never shrink, and we got bitten.** The first version freed a slot's map only when it
+  was completely empty. In the storm, survivors shared slots with expired keys, so all 16,384 maps
+  stayed at peak size: **102 MB of heap for ~12 MB of data**. The unit test had missed it because
+  there *every* key expired. Fix (ADR 010): the background pass rebuilds maps that fall below 1/4
+  of their peak. After the fix: 16 MB of heap, and RSS fell from ~330 to ~58 MB. Shrinking on
+  every delete also worked but slowed the storm down, because maps got rebuilt over and over.
+- **Expired keys linger.** They're invisible right away, but their memory can stay for a while.
+  DBSIZE counts them until they're cleaned up, as in Redis.
+- **Clock jumps.** Deadlines follow the wall clock. If the clock jumps forward (NTP, a laptop
+  waking up), many keys expire at once.
+- **Every key pays 16 bytes for TTL support** (124 vs 108 bytes/key), even keys with no TTL.
+
+**Try it yourself**
+```
+make run
+redis-cli -p 7000 set session abc EX 10      # OK
+redis-cli -p 7000 ttl session                # 10, then 9, 8, ...
+redis-cli -p 7000 set visits 0 EX 60
+redis-cli -p 7000 incr visits                # 1, and TTL is still ~60 (INCR keeps it)
+redis-cli -p 7000 set visits 5               # a plain SET removes the TTL → ttl = -1
+redis-cli -p 7000 expire visits 100 GT       # 0: "no TTL" counts as infinitely long
+redis-cli -p 7000 set k v PX 100; sleep 0.2; redis-cli -p 7000 get k   # (nil)
+bash docs/benchmarks/iter-03-expiry/storm.sh  # the 1M-key expiry storm vs Redis (~2 min)
+```
+
+**Interview question you can now answer**
+*"How would you expire millions of keys without scanning all of them?"*
+"Lazy plus sampled active expiry, like Redis. Reads check the deadline, so an expired key is never
+returned. For keys nobody reads, a background loop runs ten times a second and samples 20 keys
+that have a TTL. If more than a quarter are expired, it samples again, otherwise it moves on. So
+it's nearly free when nothing's expiring and goes flat out in a storm, with a CPU budget and a
+1 ms cap per lock so clients don't stall. I measured a million unread keys gone about a second
+after their deadline. The thing that surprised me was memory: Go maps never shrink, so I had to
+add a background compaction step. Without it, 95k surviving keys were holding 102 MB."
+
+**Check yourself**
+1. Why does the background loop sample *again* when more than 25% of a sample was expired, instead of just moving on?
+<details><summary>Answer</summary>A sample is a small random look at the slot. If more than a quarter of 20 random TTL keys are expired, a big share of the whole slot is probably expired too, so it's worth working there more. If few are, the remaining expired keys are rare and it's cheaper to let lazy expiry or a later cycle get them. That's how it adapts to load without counting anything.</details>
+
+2. We store "expires at 12:00:05" instead of "expires in 5 seconds". What breaks with the relative version once we add replication?
+<details><summary>Answer</summary>The replica gets the write a bit later (replication lag), or replays it from a log after a restart. With "5 seconds from now", each copy starts its own countdown when it *receives* the write, so the replica would keep the key alive longer than the primary, and a restart would extend every TTL. An absolute deadline means the same moment everywhere.</details>

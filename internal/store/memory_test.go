@@ -21,7 +21,7 @@ func TestMemoryPerKey(t *testing.T) {
 	keyLen, valLen := len(fmt.Sprintf("key:%012d", 0)), 16
 
 	before := heapAfterGC()
-	e := newExecutor(nil)
+	e := newExecutor(Options{})
 	defer e.Close()
 	e.Do(nil, func(tx *Tx) {
 		for i := range n {

@@ -43,6 +43,8 @@ func TestLoadErrors(t *testing.T) {
 		{"bad env int", nil, map[string]string{"SHARDIS_PORT": "abc"}},
 		{"port too high for bus port", []string{"--port", "60000"}, nil},
 		{"port zero", []string{"--port", "0"}, nil},
+		{"hz zero", []string{"--hz", "0"}, nil},
+		{"hz too high", nil, map[string]string{"SHARDIS_HZ": "501"}},
 		{"unknown flag", []string{"--nope"}, nil},
 	}
 	for _, tc := range tests {

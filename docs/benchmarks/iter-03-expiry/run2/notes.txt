@@ -1,0 +1,5 @@
+# machine: Apple M4, Darwin 25.6.0, go1.26.1, redis v=8.10.1, 2026-11-14T15:36:05Z
+# shardis: loading tmp keys took 0.72s; t=0 is the end of loading, so keys expire between t=4.28s and t=5s
+# shardis: expired_keys from INFO (Redis only): 
+# redis: loading tmp keys took 1.96s; t=0 is the end of loading, so keys expire between t=3.04s and t=5s
+# redis: expired_keys from INFO (Redis only): expired_keys:994928

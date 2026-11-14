@@ -2,8 +2,10 @@ package store
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/djism/shardis/internal/events"
+	"github.com/djism/shardis/internal/keyslot"
 )
 
 // Engine runs functions against the keyspace atomically.
@@ -17,9 +19,29 @@ type Engine interface {
 	Do(keys [][]byte, fn func(tx *Tx))
 	// DoAll runs fn with exclusive access to the whole keyspace.
 	DoAll(fn func(tx *Tx))
-	// Close stops the engine. No Do/DoAll calls may happen after it.
+	// DoGroup runs fn with exclusive access to one group of slots (the
+	// slots behind one lock). Background work such as active expiry uses
+	// it to process the keyspace a slice at a time, so clients only ever
+	// wait for one small group, never for the whole keyspace.
+	DoGroup(g int, fn func(tx *Tx, slots []uint16))
+	// Close stops the engine. No calls may happen after it.
 	Close()
 	Name() string
+}
+
+// Options configures an engine. The zero value is valid.
+type Options struct {
+	Bus *events.Bus // nil = no events
+	// Clock returns the current time in Unix milliseconds. Tests swap in a
+	// fake clock so they can jump time forward instead of sleeping.
+	Clock func() int64
+}
+
+func (o Options) clock() func() int64 {
+	if o.Clock != nil {
+		return o.Clock
+	}
+	return func() int64 { return time.Now().UnixMilli() }
 }
 
 // Engine names accepted by New (and by the --engine flag).
@@ -31,13 +53,25 @@ const (
 // Engines lists the valid engine names.
 var Engines = []string{EngineExecutor, EngineSharded}
 
-func New(kind string, bus *events.Bus) (Engine, error) {
+func New(kind string, opts Options) (Engine, error) {
 	switch kind {
 	case EngineExecutor:
-		return newExecutor(bus), nil
+		return newExecutor(opts), nil
 	case EngineSharded:
-		return newSharded(bus), nil
+		return newSharded(opts), nil
 	default:
 		return nil, fmt.Errorf("unknown engine %q (want one of %v)", kind, Engines)
 	}
 }
+
+// NumGroups is how many slot groups DoGroup accepts. Both engines use the
+// same split as the sharded engine's locks: group g holds slots g, g+256, ...
+const NumGroups = numShards
+
+var groupSlots = func() (gs [NumGroups][]uint16) {
+	for s := range keyslot.Count {
+		g := shardOf(uint16(s))
+		gs[g] = append(gs[g], uint16(s))
+	}
+	return gs
+}()

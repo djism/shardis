@@ -1,23 +1,21 @@
 package store
 
-import (
-	"sync"
-
-	"github.com/djism/shardis/internal/events"
-)
+import "sync"
 
 // executor is Redis's model: one goroutine owns the data and runs every
 // command, one after another. Atomicity is free (nothing runs concurrently)
 // and there are no locks. The cost is a hand-off per command (send to the
 // executor, wait for it to finish) and that data work uses a single core.
+// ADR 005 measured it against the sharded engine, which won.
 //
 //	conn goroutines ──fn──►  ┌──────────┐
 //	conn goroutines ──fn──►  │ executor │  runs fn(tx), signals done
 //	conn goroutines ──fn──►  └──────────┘
 type executor struct {
-	tx   Tx // locked == nil: the executor may touch anything
-	reqs chan *request
-	done chan struct{}
+	tx    Tx // locked == nil: the executor may touch anything
+	clock func() int64
+	reqs  chan *request
+	done  chan struct{}
 }
 
 type request struct {
@@ -28,9 +26,10 @@ type request struct {
 // Requests are pooled so a command doesn't allocate a fresh channel each time.
 var requestPool = sync.Pool{New: func() any { return &request{done: make(chan struct{}, 1)} }}
 
-func newExecutor(bus *events.Bus) *executor {
+func newExecutor(opts Options) *executor {
 	e := &executor{
-		tx: Tx{ks: new(keyspace), bus: bus},
+		tx:    Tx{ks: new(keyspace), bus: opts.Bus},
+		clock: opts.clock(),
 		// Buffered so many connections can queue work without each one
 		// waiting for the executor to pick it up individually.
 		reqs: make(chan *request, 1024),
@@ -43,6 +42,7 @@ func newExecutor(bus *events.Bus) *executor {
 func (e *executor) loop() {
 	defer close(e.done)
 	for r := range e.reqs {
+		e.tx.now = e.clock()
 		r.fn(&e.tx)
 		r.done <- struct{}{}
 	}
@@ -51,6 +51,10 @@ func (e *executor) loop() {
 // Do ignores keys: with one goroutine, every command already has exclusive access.
 func (e *executor) Do(_ [][]byte, fn func(*Tx)) { e.run(fn) }
 func (e *executor) DoAll(fn func(*Tx))          { e.run(fn) }
+
+func (e *executor) DoGroup(g int, fn func(*Tx, []uint16)) {
+	e.run(func(tx *Tx) { fn(tx, groupSlots[g]) })
+}
 
 func (e *executor) run(fn func(*Tx)) {
 	r := requestPool.Get().(*request)

@@ -1,9 +1,9 @@
 package server
 
 import (
-	"bytes"
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/djism/shardis/internal/store"
 )
@@ -39,28 +39,49 @@ func cmdGet(cl *client, args [][]byte) {
 	cl.w.WriteBulk(val) // safe after Do: stored values are never modified in place
 }
 
-// SET key value [NX | XX]
+// SET key value [NX | XX] [EX s | PX ms | EXAT unix-s | PXAT unix-ms | KEEPTTL]
 // NX = only if the key doesn't exist, XX = only if it does. The check and the
 // write happen inside one Do, so two racing SET NX calls can't both win.
+// Without EX/PX/... or KEEPTTL, SET removes any existing TTL (Redis rule).
 func cmdSet(cl *client, args [][]byte) {
 	key, val := args[1], args[2]
-	var nx, xx bool
-	for _, opt := range args[3:] {
-		switch {
-		case bytes.EqualFold(opt, []byte("NX")):
+	var nx, xx, keepTTL bool
+	var ttl ttlSpec
+	for i := 3; i < len(args); i++ {
+		switch opt := strings.ToUpper(string(args[i])); opt {
+		case "NX":
 			nx = true
-		case bytes.EqualFold(opt, []byte("XX")):
+		case "XX":
 			xx = true
+		case "KEEPTTL":
+			keepTTL = true
+		case "EX", "PX", "EXAT", "PXAT":
+			if ttl.set || i+1 >= len(args) {
+				cl.w.WriteError(errSyntax)
+				return
+			}
+			n, ok := parseStrictInt(args[i+1])
+			if !ok {
+				cl.w.WriteError(errNotInt)
+				return
+			}
+			if ttl, ok = newTTLSpec(opt, n); !ok || n <= 0 {
+				cl.w.WriteError(invalidExpireMsg("set"))
+				return
+			}
+			i++
 		default:
-			cl.w.WriteError(errSyntax) // EX/PX/KEEPTTL arrive with expiry in Iteration 3
+			cl.w.WriteError(errSyntax)
 			return
 		}
 	}
-	if nx && xx {
+	if (nx && xx) || (keepTTL && ttl.set) {
 		cl.w.WriteError(errSyntax)
 		return
 	}
+
 	written := false
+	var errMsg string
 	cl.do(args[1:2], func(tx *store.Tx) {
 		if nx || xx {
 			exists := tx.Exists(key)
@@ -68,12 +89,31 @@ func cmdSet(cl *client, args [][]byte) {
 				return
 			}
 		}
-		tx.Set(key, val)
 		written = true
+		switch {
+		case keepTTL:
+			tx.SetKeepTTL(key, val)
+		case ttl.set:
+			at, ok := ttl.deadline(tx.Now())
+			if !ok {
+				errMsg, written = invalidExpireMsg("set"), false
+				return
+			}
+			if at <= tx.Now() { // e.g. PXAT in the past: the key is born dead
+				tx.Delete(key)
+				return
+			}
+			tx.SetWithExpire(key, val, at)
+		default:
+			tx.Set(key, val)
+		}
 	})
-	if written {
+	switch {
+	case errMsg != "":
+		cl.w.WriteError(errMsg)
+	case written:
 		cl.w.WriteSimple("OK")
-	} else {
+	default:
 		cl.w.WriteNull() // condition not met
 	}
 }
@@ -163,7 +203,9 @@ func incrBy(cl *client, key []byte, delta int64) {
 			return
 		}
 		result = cur + delta
-		tx.Set(key, strconv.AppendInt(nil, result, 10)) // a new slice: stored values are immutable
+		// A new slice (stored values are immutable), and INCR keeps the TTL:
+		// a rate-limit counter with EXPIRE must not become immortal on INCR.
+		tx.SetKeepTTL(key, strconv.AppendInt(nil, result, 10))
 	})
 	if errMsg != "" {
 		cl.w.WriteError(errMsg)

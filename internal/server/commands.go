@@ -44,6 +44,17 @@ func (s *Server) commandTable() map[string]command {
 		"scan":     {arity: -2, run: cmdScan},
 		"dbsize":   {arity: 1, run: cmdDBSize},
 		"flushall": {arity: -1, run: cmdFlushAll},
+
+		// expiry (cmd_expire.go)
+		"expire":      {arity: -3, run: expireCommand("expire", 1000, false)},
+		"pexpire":     {arity: -3, run: expireCommand("pexpire", 1, false)},
+		"expireat":    {arity: -3, run: expireCommand("expireat", 1000, true)},
+		"pexpireat":   {arity: -3, run: expireCommand("pexpireat", 1, true)},
+		"ttl":         {arity: 2, run: ttlCommand(false, false)},
+		"pttl":        {arity: 2, run: ttlCommand(true, false)},
+		"expiretime":  {arity: 2, run: ttlCommand(false, true)},
+		"pexpiretime": {arity: 2, run: ttlCommand(true, true)},
+		"persist":     {arity: 2, run: cmdPersist},
 	}
 }
 

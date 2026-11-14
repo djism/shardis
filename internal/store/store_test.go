@@ -17,7 +17,7 @@ import (
 func forEachEngine(t *testing.T, test func(t *testing.T, e Engine)) {
 	for _, kind := range Engines {
 		t.Run(kind, func(t *testing.T) {
-			e, err := New(kind, nil)
+			e, err := New(kind, Options{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -170,7 +170,7 @@ func TestNoDeadlockOnOverlappingKeys(t *testing.T) {
 
 // The sharded engine must refuse to touch a key that wasn't locked.
 func TestShardedPanicsOnUndeclaredKey(t *testing.T) {
-	e := newSharded(nil)
+	e := newSharded(Options{})
 	declared, other := b("a"), b("{other}c")
 	defer func() {
 		if recover() == nil {
@@ -181,7 +181,7 @@ func TestShardedPanicsOnUndeclaredKey(t *testing.T) {
 }
 
 func TestShardedPanicsOnWholeKeyspaceInsideDo(t *testing.T) {
-	e := newSharded(nil)
+	e := newSharded(Options{})
 	defer func() {
 		if recover() == nil {
 			t.Fatal("expected panic for Len inside Do")
@@ -228,7 +228,7 @@ func TestScanVisitsStableKeysOnce(t *testing.T) {
 }
 
 func TestDeleteReleasesEmptySlotMaps(t *testing.T) {
-	e := newExecutor(nil)
+	e := newExecutor(Options{})
 	defer e.Close()
 	k := b("k")
 	e.Do(nil, func(tx *Tx) {
@@ -244,7 +244,7 @@ func TestWritesEmitEvents(t *testing.T) {
 	bus := events.NewBus("n1")
 	sub := bus.Subscribe(10)
 	defer sub.Close()
-	e := newExecutor(bus)
+	e := newExecutor(Options{Bus: bus})
 	defer e.Close()
 	e.Do(nil, func(tx *Tx) { tx.Set(b("k"), b("v")); tx.Delete(b("k")) })
 	for _, want := range []string{"set", "del"} {
@@ -256,7 +256,7 @@ func TestWritesEmitEvents(t *testing.T) {
 }
 
 func TestNewRejectsUnknownEngine(t *testing.T) {
-	if _, err := New("nope", nil); err == nil {
+	if _, err := New("nope", Options{}); err == nil {
 		t.Fatal("expected error")
 	}
 }
@@ -314,7 +314,7 @@ func BenchmarkDoSpread(b *testing.B) {
 	val := []byte("v")
 	for _, kind := range Engines {
 		b.Run(kind, func(b *testing.B) {
-			e, _ := New(kind, nil)
+			e, _ := New(kind, Options{})
 			defer e.Close()
 			b.ReportAllocs()
 			b.RunParallel(func(pb *testing.PB) {
@@ -333,7 +333,7 @@ func BenchmarkDoSpread(b *testing.B) {
 func BenchmarkDoHotKey(b *testing.B) {
 	for _, kind := range Engines {
 		b.Run(kind, func(b *testing.B) {
-			e, _ := New(kind, nil)
+			e, _ := New(kind, Options{})
 			defer e.Close()
 			key, val := []byte("key:1"), []byte("v")
 			b.ReportAllocs()

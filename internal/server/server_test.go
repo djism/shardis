@@ -28,10 +28,14 @@ func startServer(t *testing.T) (addr string, stop func() error) {
 
 func startServerWith(t *testing.T, engineKind string) (addr string, stop func() error) {
 	t.Helper()
-	engine, err := store.New(engineKind, nil)
+	engine, err := store.New(engineKind, store.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Active expiry at 100 cycles/s so tests that wait for TTLs are quick.
+	expCtx, stopExpirer := context.WithCancel(context.Background())
+	expDone := make(chan struct{})
+	go func() { store.NewActiveExpirer(engine, 100).Run(expCtx); close(expDone) }()
 	s := New(slog.New(slog.NewTextHandler(io.Discard, nil)), engine)
 	if err := s.Listen("127.0.0.1:0"); err != nil {
 		t.Fatal(err)
@@ -57,6 +61,8 @@ func startServerWith(t *testing.T, engineKind string) (addr string, stop func() 
 		if err := stop(); err != nil {
 			t.Error(err)
 		}
+		stopExpirer()
+		<-expDone
 		engine.Close()
 	})
 	return s.Addr().String(), stop

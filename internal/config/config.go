@@ -27,6 +27,10 @@ type Config struct {
 	// goroutine owns everything, like Redis). See ADR 005. Unknown names are
 	// rejected when the store is created.
 	Engine string
+
+	// Hz is how many active-expiry cycles run per second (Redis's "hz",
+	// default 10). Higher = expired keys are freed sooner, at more CPU cost.
+	Hz int
 }
 
 // Load builds a Config from args (usually os.Args[1:]) and getenv (usually os.Getenv).
@@ -43,12 +47,18 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if err := integer(fs, getenv, &cfg.Port, "port", 7000, "client port"); err != nil {
 		return Config{}, err
 	}
+	if err := integer(fs, getenv, &cfg.Hz, "hz", 10, "active expiry cycles per second (1-500)"); err != nil {
+		return Config{}, err
+	}
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
 	if cfg.Port < 1 || cfg.Port > 55535 {
 		// 55535 because the cluster bus port (Port+10000) must still fit in 65535.
 		return Config{}, fmt.Errorf("port %d out of range 1-55535", cfg.Port)
+	}
+	if cfg.Hz < 1 || cfg.Hz > 500 { // Redis's allowed range
+		return Config{}, fmt.Errorf("hz %d out of range 1-500", cfg.Hz)
 	}
 	return cfg, nil
 }
