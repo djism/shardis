@@ -38,6 +38,14 @@ type Config struct {
 	MaxMemory        int64
 	MaxMemoryPolicy  string
 	MaxMemorySamples int
+
+	// Persistence (ADR 014-016).
+	Dir                   string // data directory (AOF files go in Dir/appendonlydir)
+	AppendOnly            bool
+	AppendFsync           string // always, everysec, no
+	AutoAOFRewritePercent int
+	AutoAOFRewriteMinSize int64
+	DebugRecordSynced     bool // fault injection for the crash test; never in production
 }
 
 // Load builds a Config from args (usually os.Args[1:]) and getenv (usually os.Getenv).
@@ -63,6 +71,15 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if err := integer(fs, getenv, &cfg.MaxMemorySamples, "maxmemory-samples", 5, "keys sampled per eviction (approximate LRU / TTL)"); err != nil {
 		return Config{}, err
 	}
+	var appendonly, rewriteMin, recordSynced string
+	str(fs, getenv, &cfg.Dir, "dir", ".", "data directory")
+	str(fs, getenv, &appendonly, "appendonly", "no", "persist writes to an append-only file: yes or no")
+	str(fs, getenv, &cfg.AppendFsync, "appendfsync", "everysec", "fsync policy: always, everysec or no")
+	if err := integer(fs, getenv, &cfg.AutoAOFRewritePercent, "auto-aof-rewrite-percentage", 100, "rewrite the AOF when it grows by this % (0 = never)"); err != nil {
+		return Config{}, err
+	}
+	str(fs, getenv, &rewriteMin, "auto-aof-rewrite-min-size", "64mb", "don't auto-rewrite an AOF smaller than this")
+	str(fs, getenv, &recordSynced, "debug-record-synced", "no", "FAULT INJECTION (crash test only): record fsynced AOF length")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -74,10 +91,30 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if cfg.MaxMemory, err = ParseMemory(maxmem); err != nil {
 		return Config{}, err
 	}
+	if cfg.AutoAOFRewriteMinSize, err = ParseMemory(rewriteMin); err != nil {
+		return Config{}, err
+	}
+	if cfg.AppendOnly, err = yesNo("appendonly", appendonly); err != nil {
+		return Config{}, err
+	}
+	if cfg.DebugRecordSynced, err = yesNo("debug-record-synced", recordSynced); err != nil {
+		return Config{}, err
+	}
 	if cfg.Hz < 1 || cfg.Hz > 500 { // Redis's allowed range
 		return Config{}, fmt.Errorf("hz %d out of range 1-500", cfg.Hz)
 	}
 	return cfg, nil
+}
+
+// yesNo parses redis.conf-style booleans.
+func yesNo(name, v string) (bool, error) {
+	switch strings.ToLower(v) {
+	case "yes", "true", "1":
+		return true, nil
+	case "no", "false", "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s: want yes or no, got %q", name, v)
 }
 
 // EnvName turns a flag name like "node-timeout" into "SHARDIS_NODE_TIMEOUT".

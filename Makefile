@@ -12,6 +12,7 @@ help: ## list targets
 build: ## build binaries into bin/
 	go build -o $(BIN) ./cmd/shardis
 	go build -o bin/shardis-loadgen ./cmd/shardis-loadgen
+	go build -o bin/shardis-crashtest ./cmd/shardis-crashtest
 
 test: ## run all tests with the race detector
 	go test -race -count=1 $(PKG)
@@ -39,7 +40,7 @@ lint: vet ## fail if any file is not gofmt-formatted
 	@out=$$(gofmt -l $(GOFILES)); if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
 
 clean: ## remove build output
-	rm -f $(BIN) bin/shardis-loadgen
+	rm -f $(BIN) bin/shardis-loadgen bin/shardis-crashtest
 
 cluster-up: ## 6-node cluster with docker compose (Iteration 7)
 	@echo "cluster-up arrives in Iteration 7 (deploy/compose)"

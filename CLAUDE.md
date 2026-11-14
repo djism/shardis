@@ -120,6 +120,7 @@ These records feed the "Design decisions" section of the website, so write them 
 ```
 cmd/shardis/          server binary
 cmd/shardis-loadgen/  Zipf "cache-aside" load generator (hit rate, latency)
+cmd/shardis-crashtest/ crash a real server mid-load, count lost acknowledged writes
 cmd/shardis-observer/ streams cluster events over WebSocket for the website
 cmd/shardis-chaos/    runs chaos scenarios + consistency checker, records traces
 internal/resp/        protocol parser/writer
@@ -127,7 +128,7 @@ internal/server/      TCP listener, per-connection loop, command table
 internal/config/      flags + SHARDIS_* env config
 internal/store/       in-memory keyspace (one map per hash slot), engines (sharded locks / executor), expiry, eviction
 internal/keyslot/     CRC16 + hash tags → slot (verified against real Redis)
-internal/persist/     AOF + snapshots
+internal/persist/     AOF (effects log, group commit, fsync policies), manifest, fuzzy rewrite
 internal/replication/ primary/replica sync
 internal/cluster/     slots, cluster bus, gossip, failure detection, failover, resharding
 internal/events/      event bus
@@ -146,7 +147,7 @@ ROADMAP.md            iteration plan
 
 ```
 make help         # list all targets
-make build        # build binaries (bin/shardis, bin/shardis-loadgen)
+make build        # build binaries (bin/shardis, bin/shardis-loadgen, bin/shardis-crashtest)
 make test         # go test -race ./...
 make test-memory  # heap-measuring tests (skipped under -race; CI runs both)
 make lint         # go vet + gofmt check (what CI runs first)
@@ -158,6 +159,7 @@ make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* en
                   # --hz 10   active-expiry cycles per second (ADR 008)
                   # --maxmemory 64mb --maxmemory-policy allkeys-lru (ADR 011-013)
                   #   (warns below 32mb: the 16384 slot maps alone use ~9-14 MB)
+                  # --appendonly yes --appendfsync everysec --dir /data  (ADR 014-016)
 SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
 bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
 bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
@@ -165,6 +167,8 @@ bash docs/benchmarks/iter-02-concurrency/gc.sh    # memory per key + GC pauses w
 bash docs/benchmarks/iter-03-expiry/storm.sh      # 1M-key expiry storm vs Redis (~2 min)
 bash docs/benchmarks/iter-04-eviction/run.sh      # eviction hit rates vs Redis (~8 min)
 bin/shardis-loadgen -addr 127.0.0.1:7000          # Zipf cache-aside traffic: hit rate, latency
+bin/shardis-crashtest -runs 10                    # kill -9 / simulated power cut, lost acked writes
+bash docs/benchmarks/iter-05-persistence/run.sh   # crash table + throughput per fsync policy (~10 min)
 ```
 
 macOS note: AirPlay Receiver listens on *:7000. Binding 127.0.0.1:7000 (the default) works;

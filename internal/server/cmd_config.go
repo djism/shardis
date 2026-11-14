@@ -1,12 +1,14 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/djism/shardis/internal/config"
+	"github.com/djism/shardis/internal/persist"
 	"github.com/djism/shardis/internal/store"
 )
 
@@ -50,8 +52,37 @@ var configParams = []configParam{
 			return s.evictor.SetSamples(n)
 		}},
 	{name: "hz", get: func(s *Server) string { return strconv.Itoa(s.hz) }},
-	{name: "save", get: func(*Server) string { return "" }},
-	{name: "appendonly", get: func(*Server) string { return "no" }},
+	{name: "save", get: func(*Server) string { return "" }}, // no RDB snapshots; the AOF base plays that role
+	{name: "appendonly", get: func(s *Server) string {
+		if s.aof != nil {
+			return "yes"
+		}
+		return "no"
+	}},
+	{name: "appendfsync",
+		get: func(s *Server) string {
+			if s.aof != nil {
+				return s.aof.Fsync().String()
+			}
+			return persist.FsyncEverySec.String()
+		},
+		set: func(s *Server, v string) error {
+			f, err := persist.ParseFsync(v)
+			if err != nil {
+				return err
+			}
+			if s.aof == nil {
+				return errors.New("AOF is not enabled")
+			}
+			s.aof.SetFsync(f)
+			return nil
+		}},
+	{name: "dir", get: func(s *Server) string {
+		if s.aof != nil {
+			return s.aof.Dir()
+		}
+		return "."
+	}},
 }
 
 func (s *Server) maxmemory() int64 {
@@ -122,7 +153,7 @@ func configSet(cl *client, pairs [][]byte) {
 	for i := 0; i < len(pairs); i += 2 {
 		name := strings.ToLower(string(pairs[i]))
 		j := slices.IndexFunc(configParams, func(p configParam) bool { return p.name == name })
-		if j < 0 || configParams[j].set == nil || cl.srv.evictor == nil {
+		if j < 0 || configParams[j].set == nil || (cl.srv.evictor == nil && strings.HasPrefix(name, "maxmemory")) {
 			cl.w.WriteError(fmt.Sprintf("ERR Unknown option or number of arguments for CONFIG SET - '%s'", truncate(pairs[i], 128)))
 			return
 		}

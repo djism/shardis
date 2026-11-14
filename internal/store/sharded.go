@@ -40,6 +40,7 @@ type sharded struct {
 	ks    *keyspace
 	bus   *events.Bus
 	clock func() int64
+	log   logRef
 	locks [numShards]paddedMutex
 }
 
@@ -54,8 +55,16 @@ func (s *sharded) Do(keys [][]byte, fn func(*Tx)) {
 	}
 	s.lockSet(&set)
 	defer s.unlockSet(&set)
-	tx := Tx{ks: s.ks, bus: s.bus, now: s.clock(), locked: &set}
-	fn(&tx)
+	s.run(&Tx{ks: s.ks, bus: s.bus, now: s.clock(), locked: &set}, fn)
+}
+
+// run executes fn and hands its effects to the log while the caller still
+// holds the locks, so same-key effects are logged in commit order.
+func (s *sharded) run(tx *Tx, fn func(*Tx)) {
+	l := s.log.get()
+	tx.logging = l != nil
+	fn(tx)
+	tx.flushEffects(l)
 }
 
 func (s *sharded) DoGroup(g int, fn func(*Tx, []uint16)) {
@@ -63,8 +72,7 @@ func (s *sharded) DoGroup(g int, fn func(*Tx, []uint16)) {
 	set.add(g)
 	s.locks[g].Lock()
 	defer s.locks[g].Unlock()
-	tx := Tx{ks: s.ks, bus: s.bus, now: s.clock(), locked: &set}
-	fn(&tx, groupSlots[g])
+	s.run(&Tx{ks: s.ks, bus: s.bus, now: s.clock(), locked: &set}, func(tx *Tx) { fn(tx, groupSlots[g]) })
 }
 
 func (s *sharded) DoAll(fn func(*Tx)) {
@@ -76,8 +84,7 @@ func (s *sharded) DoAll(fn func(*Tx)) {
 			s.locks[i].Unlock()
 		}
 	}()
-	tx := Tx{ks: s.ks, bus: s.bus, now: s.clock()}
-	fn(&tx)
+	s.run(&Tx{ks: s.ks, bus: s.bus, now: s.clock()}, fn)
 }
 
 // lockSet takes the locks in ascending shard order. Every caller uses the
@@ -105,4 +112,5 @@ func (s *sharded) unlockSet(set *shardSet) {
 func (s *sharded) Close()              {}
 func (s *sharded) Name() string        { return EngineSharded }
 func (s *sharded) Stats() Stats        { return s.ks.stats() }
+func (s *sharded) SetLog(l Log)        { s.log.set(l) }
 func (s *sharded) keyspace() *keyspace { return s.ks }

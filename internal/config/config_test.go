@@ -45,6 +45,7 @@ func TestLoadErrors(t *testing.T) {
 		{"port zero", []string{"--port", "0"}, nil},
 		{"hz zero", []string{"--hz", "0"}, nil},
 		{"bad maxmemory", []string{"--maxmemory", "lots"}, nil},
+		{"bad appendonly", []string{"--appendonly", "maybe"}, nil},
 		{"hz too high", nil, map[string]string{"SHARDIS_HZ": "501"}},
 		{"unknown flag", []string{"--nope"}, nil},
 	}
@@ -74,6 +75,16 @@ func TestMaxMemoryFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.MaxMemory != 100<<20 || cfg.MaxMemoryPolicy != "allkeys-lru" || cfg.MaxMemorySamples != 10 {
+		t.Fatalf("got %+v", cfg)
+	}
+}
+
+func TestPersistenceFlags(t *testing.T) {
+	cfg, err := Load([]string{"--appendonly", "yes", "--appendfsync", "always", "--dir", "/tmp/x"}, fakeEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AppendOnly || cfg.AppendFsync != "always" || cfg.Dir != "/tmp/x" || cfg.AutoAOFRewriteMinSize != 64<<20 {
 		t.Fatalf("got %+v", cfg)
 	}
 }

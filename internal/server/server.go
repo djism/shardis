@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/djism/shardis/internal/persist"
 	"github.com/djism/shardis/internal/resp"
 	"github.com/djism/shardis/internal/store"
 )
@@ -24,6 +25,7 @@ type Options struct {
 	Log     *slog.Logger   // nil = discard
 	Engine  store.Engine   // the caller owns it and closes it after Serve returns
 	Evictor *store.Evictor // nil = no memory limit
+	AOF     *persist.AOF   // nil = no persistence; the caller closes it after Serve returns
 	Hz      int            // for INFO and CONFIG GET hz
 }
 
@@ -31,6 +33,7 @@ type Server struct {
 	log      *slog.Logger
 	engine   store.Engine
 	evictor  *store.Evictor
+	aof      *persist.AOF
 	hz       int
 	commands map[string]command
 	started  time.Time
@@ -53,7 +56,7 @@ func New(opts Options) *Server {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{
-		log: log, engine: opts.Engine, evictor: opts.Evictor, hz: opts.Hz,
+		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, hz: opts.Hz,
 		conns: make(map[net.Conn]*client), started: time.Now(),
 	}
 	s.commands = s.commandTable()
@@ -156,6 +159,10 @@ type client struct {
 	w    *resp.Writer
 	quit bool // set by QUIT: flush the reply, then hang up
 
+	// needDurable is set after a write command; the next bytes sent to the
+	// socket wait for the AOF first (durableConn).
+	needDurable bool
+
 	// cmds counts this connection's commands. Per connection rather than one
 	// server-wide counter, so 10 cores running commands don't all fight over
 	// the same memory. INFO adds them up.
@@ -168,11 +175,14 @@ func (s *Server) handle(c net.Conn) {
 	log := s.log.With("remote", c.RemoteAddr().String())
 	log.Debug("conn open")
 
-	w := resp.NewWriter(c)
+	cl := &client{srv: s}
+	// Every byte headed for the socket goes through durableConn, which waits
+	// for the AOF first if this connection ran a write (ADR 015).
+	w := resp.NewWriter(durableConn{conn: c, cl: cl})
+	cl.w = w
 	// Replies are flushed right before we'd block waiting for more input
 	// (see flushBeforeRead), so a pipelined batch gets one write syscall.
 	r := resp.NewReader(flushBeforeRead{conn: c, w: w})
-	cl := &client{srv: s, w: w}
 	s.mu.Lock()
 	s.conns[c] = cl
 	s.mu.Unlock()
@@ -217,6 +227,33 @@ func (s *Server) endConn(log *slog.Logger, w *resp.Writer, err error) {
 // Doing it here, instead of checking Buffered() in the loop, also covers a
 // partial command sitting in the buffer: we still flush before blocking on
 // its remaining bytes.
+// durableConn is the socket as the reply writer sees it. If the connection
+// has run a write since its last reply went out, it first waits until the
+// AOF covers that write (written to the kernel, or fsynced for "always").
+// Putting the wait here, rather than at our explicit flush points, means no
+// path can send an "OK" early: not even the reply buffer filling up and
+// flushing itself in the middle of a big pipeline.
+//
+// If the AOF has failed, we return the error instead of sending the
+// replies: the connection drops, and the client never hears "OK" for a
+// write that may not be on disk.
+type durableConn struct {
+	conn net.Conn
+	cl   *client
+}
+
+func (d durableConn) Write(p []byte) (int, error) {
+	if d.cl.needDurable {
+		d.cl.needDurable = false
+		if aof := d.cl.srv.aof; aof != nil {
+			if err := aof.WaitDurable(); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return d.conn.Write(p)
+}
+
 type flushBeforeRead struct {
 	conn net.Conn
 	w    *resp.Writer

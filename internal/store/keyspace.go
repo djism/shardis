@@ -109,6 +109,12 @@ type Tx struct {
 	// command that forgets to declare a key fails loudly in tests instead
 	// of silently racing in production.
 	locked *shardSet
+
+	// logging is true when the engine has a Log (AOF). Changes are then
+	// recorded as effects in out, which the engine hands to the log before
+	// releasing its locks (effects.go, ADR 014).
+	logging bool
+	out     []byte
 }
 
 // Now is the current time (Unix ms) as seen by this command.
@@ -201,6 +207,7 @@ func (t *Tx) SetWithExpire(key, val []byte, at int64) {
 	}
 	e := entry{val: val, expireAt: at, lru: t.nowSec()}
 	m[k] = e
+	t.recordSet(k, e)
 	t.ks.mem.add(t.ks.entrySize(k, e))
 	if n := int32(len(m)); n > t.ks.peak[s] {
 		t.ks.setPeak(s, n)
@@ -223,9 +230,11 @@ func (t *Tx) SetExpire(key []byte, at int64) bool {
 	k := string(key)
 	if at != 0 && at <= t.now {
 		t.remove(s, k)
+		t.recordDel(k)
 		t.emitWrite("del", key, s)
 		return true
 	}
+	t.recordExpire(k, at)
 	t.ks.mem.add(-t.ks.entrySize(k, e))
 	e.expireAt = at
 	t.ks.slots[s][k] = e
@@ -241,6 +250,7 @@ func (t *Tx) Delete(key []byte) bool {
 		return false
 	}
 	t.remove(s, string(key))
+	t.recordDel(string(key))
 	t.emitWrite("del", key, s)
 	return true
 }
@@ -251,6 +261,7 @@ func (t *Tx) Delete(key []byte) bool {
 // to send a DEL.
 func (t *Tx) expire(s uint16, k string, how string) {
 	t.remove(s, k)
+	t.recordDel(k)
 	t.ks.mem.expired.Add(1)
 	if t.bus.Active() {
 		t.bus.Emit("expire", map[string]any{"key": k, "slot": s, "how": how})
@@ -265,6 +276,7 @@ func (t *Tx) evict(s uint16, k string, policy Policy) bool {
 		return false // deleted since it was sampled
 	}
 	t.remove(s, k)
+	t.recordDel(k)
 	t.ks.mem.evicted.Add(1)
 	if t.bus.Active() {
 		t.bus.Emit("evict", map[string]any{"key": k, "slot": s, "policy": policy.String()})
@@ -386,6 +398,7 @@ func (t *Tx) Flush() {
 	if t.ks.exact != nil {
 		t.ks.exact.reset()
 	}
+	t.recordFlush()
 	if t.bus.Active() {
 		t.bus.Emit("flushall", nil)
 	}

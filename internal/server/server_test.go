@@ -121,7 +121,7 @@ func TestCommands(t *testing.T) {
 		{"command docs", "COMMAND DOCS\r\n", "*0\r\n"},
 		{"command count", "COMMAND COUNT\r\n", fmt.Sprintf(":%d\r\n", len(New(Options{}).commands))},
 		{"config get", "CONFIG GET save\r\n", "*2\r\n$4\r\nsave\r\n$0\r\n\r\n"},
-		{"config get glob", "CONFIG GET APPEND*\r\n", "*2\r\n$10\r\nappendonly\r\n$2\r\nno\r\n"},
+		{"config get glob", "CONFIG GET APPEND*\r\n", "*4\r\n$10\r\nappendonly\r\n$2\r\nno\r\n$11\r\nappendfsync\r\n$8\r\neverysec\r\n"},
 		{"config get none", "CONFIG GET nope\r\n", "*0\r\n"},
 		{"config set unknown", "CONFIG SET a b\r\n", "-ERR Unknown option or number of arguments for CONFIG SET - 'a'\r\n"},
 		{"command bad sub", "COMMAND NOPE\r\n", "-ERR unknown subcommand 'NOPE'. Try COMMAND HELP.\r\n"},

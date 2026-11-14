@@ -388,3 +388,79 @@ random. I also evict before the write takes its locks, so eviction can't deadloc
 
 2. Why does the memory estimate track each slot map's *peak* size instead of its current size?
 <details><summary>Answer</summary>Go maps grow by doubling and never shrink. A map that once held 60 keys keeps its 128-slot array even after 55 are deleted. So the memory a map really uses follows from the most it has ever held, until compaction rebuilds it smaller. Using the current size would undercount, and eviction would let real memory blow past the limit.</details>
+
+## Iteration 5: Persistence
+
+**What we built**
+An append-only file (AOF) that records every change, so data survives restarts and crashes, with
+Redis's three fsync policies (`always`, `everysec`, `no`). On startup the AOF is replayed. In the
+background it's compacted with a snapshot that doesn't stop writes. A crash-test tool kills the
+server mid-load 70 times and counts acknowledged writes that went missing, for each policy and for
+two kinds of crash.
+
+**How it works**
+```
+SET k v ─► store records the effect "SET k v" ─► AOF buffer ─► writer goroutine: write() ─┬─► disk
+   │                                                                (always: fsync now) │
+   └── reply waits here until write() (or fsync, for always) covers it ◄────────────────┘
+   everysec: fsync once a second, separately     no: never fsync, the OS decides
+```
+- **Effects, not commands.** `INCR x` is logged as `SET x 6`, `EXPIRE k 10` as `PEXPIREAT k
+  <exact time>`, and every expiry or eviction as `DEL k`. Replaying always gives the same result.
+- **Group commit.** One fsync covers every write that's waiting at that moment. 50 waiting clients
+  means 1 fsync, not 50.
+- **Files:** a base snapshot + incremental files + a manifest listing them, replaced atomically
+  (temp file, fsync, rename, fsync the directory).
+- **Rewrite without stopping the world:** switch to a new incremental file, then copy the keyspace
+  out one shard group at a time. The snapshot isn't from one instant, but every record is absolute
+  ("x is now 6"), so replaying a few records that are already in the snapshot gives the same answer.
+
+**Why we did it this way**
+- *Effects (ADR 014):* deterministic replay, expiries and evictions logged for free, and the same
+  stream feeds replicas in Iteration 6.
+- *Reply after write() (ADR 015):* process crashes (by far the most common kind) lose nothing with
+  any policy. We measured 0 of ~6.4M acknowledged writes lost in 30 `kill -9` runs.
+- *Fuzzy snapshot (ADR 016):* Go can't `fork()` like Redis, so we rely on idempotent records.
+  40 out of 40 test rounds with writers hammering keys *during* the rewrite restored the exact state.
+
+**What can go wrong**
+- **fsync is about machine crashes, not process crashes.** In a simulated power cut, `everysec`
+  lost 0.3–0.9 s of acknowledged writes each time, and `no` lost everything not yet flushed by
+  the OS. Only `always` lost nothing, at ~20x lower throughput (5.9k vs 115k writes/s).
+- **Tail latency.** With the AOF on, our p99 is 9 ms vs Redis's 1.5 ms (`everysec`). Likely a
+  `write()` waiting behind an in-progress fsync, which Redis avoids by postponing writes. Not
+  fixed yet.
+- **The log is one sequence.** Every write takes the log mutex briefly, which will matter at
+  higher core counts. Per-slot logs would fix it.
+- **Bugs we hit:** a variadic `...string` helper secretly copied every value (allocation), and
+  `Close` panicked when called twice. Both were caught and fixed while building.
+
+**Try it yourself**
+```
+make build
+./bin/shardis --appendonly yes --appendfsync everysec --dir /tmp/shardis
+redis-cli -p 7000 set name shardis; redis-cli -p 7000 incrby visits 42
+# Ctrl-C, start it again with the same flags:
+redis-cli -p 7000 get visits                     # "42"
+cat /tmp/shardis/appendonlydir/shardis.aof.1.incr.aof   # the log is readable RESP: SET visits 42
+redis-cli -p 7000 bgrewriteaof; redis-cli -p 7000 info persistence
+./bin/shardis-crashtest -runs 3                  # kill -9 / power-cut table per policy
+bash docs/benchmarks/iter-05-persistence/run.sh  # full measurement (~10 min)
+```
+
+**Interview question you can now answer**
+*"Your cache has a persistence option. If the server crashes, can it lose writes it already acknowledged?"*
+"It depends on what crashes. I measured it. If only the process dies (kill -9, OOM kill, a
+panic), we lose nothing under any fsync policy, because a write is acknowledged only after it's
+been handed to the kernel: 0 of 6.4 million acknowledged writes lost in 30 crash runs. If the
+machine dies, only what was fsynced survives. With `everysec` that's up to about a second of
+writes (I measured 0.3 to 0.9 s), with `always` nothing, but `always` is about 20 times slower
+even with group commit, because each fsync takes ~8 ms on my disk. In practice I'd use
+`everysec` plus a replica: two machines' memory is usually safer and faster than one fsync."
+
+**Check yourself**
+1. With `appendfsync no`, a `kill -9` lost zero acknowledged writes. Why doesn't "no fsync" mean "data loss" here?
+<details><summary>Answer</summary>Every reply waited until its write was handed to the kernel with write(). After that, the data lives in the kernel's page cache, which belongs to the OS, not our process. Killing the process doesn't touch it, and the OS writes it to disk eventually. fsync only protects against the OS or machine going down before that happens.</details>
+
+2. Why would the fuzzy snapshot break if the AOF logged `INCR x` instead of `SET x 6`?
+<details><summary>Answer</summary>The snapshot may already include the result of an INCR that's also in the new incremental file. Replaying "SET x 6" again changes nothing, because it's idempotent. Replaying "INCR x" again would add 1 a second time and give the wrong value. The fuzzy snapshot is only correct because every record states the result, not the change.</details>

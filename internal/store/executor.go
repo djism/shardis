@@ -13,6 +13,7 @@ import "sync"
 //	conn goroutines ──fn──►  └──────────┘
 type executor struct {
 	tx    Tx // locked == nil: the executor may touch anything
+	log   logRef
 	clock func() int64
 	reqs  chan *request
 	done  chan struct{}
@@ -42,8 +43,10 @@ func newExecutor(opts Options) *executor {
 func (e *executor) loop() {
 	defer close(e.done)
 	for r := range e.reqs {
-		e.tx.now = e.clock()
+		l := e.log.get()
+		e.tx.now, e.tx.logging = e.clock(), l != nil
 		r.fn(&e.tx)
+		e.tx.flushEffects(l)
 		r.done <- struct{}{}
 	}
 }
@@ -72,4 +75,5 @@ func (e *executor) Close() {
 
 func (e *executor) Name() string        { return EngineExecutor }
 func (e *executor) Stats() Stats        { return e.tx.ks.stats() }
+func (e *executor) SetLog(l Log)        { e.log.set(l) }
 func (e *executor) keyspace() *keyspace { return e.tx.ks }

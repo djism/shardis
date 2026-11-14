@@ -8,6 +8,7 @@ import (
 
 	"github.com/djism/shardis/internal/config"
 	"github.com/djism/shardis/internal/events"
+	"github.com/djism/shardis/internal/persist"
 	"github.com/djism/shardis/internal/server"
 	"github.com/djism/shardis/internal/store"
 )
@@ -34,6 +35,18 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	// command can be mid-flight when the engine stops.
 	defer engine.Close()
 
+	// Persistence: replay the AOF into the engine *before* serving, and only
+	// then start logging new effects (so replayed ones aren't logged twice).
+	var aof *persist.AOF
+	if cfg.AppendOnly {
+		if aof, err = openAOF(cfg, engine); err != nil {
+			return err
+		}
+		// Runs after Serve returns (defers are last-in-first-out): every
+		// pending write is written and fsynced, so a clean shutdown loses nothing.
+		defer aof.Close()
+	}
+
 	// Active expiry runs until run returns. Defers run last-in-first-out:
 	// stopExpiry, then wait for it to exit, then (above) engine.Close, so it
 	// never touches a closed engine. Its own context means an early return
@@ -58,7 +71,7 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 		slog.Warn("maxmemory is below 32 MB; the hash-slot maps alone use ~9-14 MB", "maxmemory", cfg.MaxMemory)
 	}
 
-	srv := server.New(server.Options{Log: slog.Default(), Engine: engine, Evictor: evictor, Hz: cfg.Hz})
+	srv := server.New(server.Options{Log: slog.Default(), Engine: engine, Evictor: evictor, AOF: aof, Hz: cfg.Hz})
 	if err := srv.Listen(addr); err != nil {
 		return err
 	}
@@ -68,4 +81,31 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	err = srv.Serve(ctx) // returns once ctx is cancelled and all connections are closed
 	slog.Info("shardis stopped")
 	return err
+}
+
+func openAOF(cfg config.Config, engine store.Engine) (*persist.AOF, error) {
+	fsync, err := persist.ParseFsync(cfg.AppendFsync)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.DebugRecordSynced {
+		slog.Warn("FAULT INJECTION ON: --debug-record-synced (crash testing only)")
+	}
+	aof, err := persist.Open(persist.Options{
+		Dir: cfg.Dir, Fsync: fsync, Log: slog.Default(),
+		RewritePercent: cfg.AutoAOFRewritePercent, RewriteMinSize: cfg.AutoAOFRewriteMinSize,
+		RecordSynced: cfg.DebugRecordSynced,
+	})
+	if err != nil {
+		return nil, err
+	}
+	st, err := aof.Load(engine)
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("AOF loaded", "files", st.Files, "records", st.Records, "bytes", st.Bytes, "took", st.Took, "truncated", st.Truncated)
+	if err := aof.Start(engine); err != nil {
+		return nil, err
+	}
+	return aof, nil
 }

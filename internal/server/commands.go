@@ -41,6 +41,9 @@ func (s *Server) commandTable() map[string]command {
 		"config":  {arity: -2, run: cmdConfig},
 		"info":    {arity: -1, run: cmdInfo},
 
+		// persistence (cmd_persist.go)
+		"bgrewriteaof": {arity: 1, run: cmdBgRewriteAOF},
+
 		// strings (cmd_strings.go)
 		"get":    {arity: 2, run: cmdGet},
 		"set":    {arity: -3, flags: wd, run: cmdSet},
@@ -84,6 +87,15 @@ func (s *Server) dispatch(cl *client, args [][]byte) {
 		return
 	}
 	cl.cmds.Add(1)
+	if cmd.flags&flagWrite != 0 && s.aof != nil {
+		// Once the AOF has failed (disk full, I/O error), refuse writes:
+		// we couldn't make them durable. Like Redis's MISCONF error.
+		if err := s.aof.Err(); err != nil {
+			cl.w.WriteError("MISCONF Errors writing to the AOF file: " + err.Error())
+			return
+		}
+		defer func() { cl.needDurable = true }()
+	}
 	// Make room *before* the command takes its locks: eviction has to lock
 	// other shards, and doing that while holding this command's locks could
 	// deadlock (ADR 013).

@@ -29,6 +29,9 @@ type Engine interface {
 	Name() string
 	// Stats returns memory and hit/miss counters. Safe to call any time.
 	Stats() Stats
+	// SetLog starts (or, with nil, stops) recording effects to l. Call it
+	// after loading the AOF, so replayed effects aren't logged again.
+	SetLog(l Log)
 
 	keyspace() *keyspace // for the Evictor, which lives in this package
 }
