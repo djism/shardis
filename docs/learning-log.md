@@ -464,3 +464,81 @@ even with group commit, because each fsync takes ~8 ms on my disk. In practice I
 
 2. Why would the fuzzy snapshot break if the AOF logged `INCR x` instead of `SET x 6`?
 <details><summary>Answer</summary>The snapshot may already include the result of an INCR that's also in the new incremental file. Replaying "SET x 6" again changes nothing, because it's idempotent. Replaying "INCR x" again would add 1 a second time and give the wrong value. The fuzzy snapshot is only correct because every record states the result, not the change.</details>
+
+## Iteration 6: Primary → replica replication
+
+**What we built**
+Replicas: `REPLICAOF host port` turns a node into a live, read-only copy of a primary, and
+`REPLICAOF NO ONE` promotes it. Replicas catch up after a disconnect from a backlog instead of
+re-copying everything, even after a failover. `WAIT` tells a client how many replicas have its
+writes. Plus a fault-injection framework, which we used to reproduce, on purpose, the moment
+replication loses an acknowledged write.
+
+**How it works**
+```
+client ─SET─► primary: apply, AOF, append effect to the backlog ─► reply OK   ◄── acknowledged here
+                              │ (ring buffer, every byte numbered by offset)
+                              └─ sender goroutine per replica ──► replica: apply, ACK offset
+```
+- **The stream is the effect log from Iteration 5** (`SET x 6`, `PEXPIREAT k <time>`, `DEL k`),
+  so replicas end up byte-for-byte in sync.
+- **Reconnect:** "I'm at offset X of history Y" → still in the backlog? Send just the gap. Too old?
+  Full sync: stream a fuzzy snapshot, then the stream from where it started.
+- **After a promotion,** the new primary remembers the old history ID, so the other replicas
+  continue without a full copy (PSYNC2).
+- **Replicas never expire keys themselves.** They hide expired keys and wait for the primary's
+  `DEL`, so they can't disagree with it.
+
+**Why we did it this way**
+- *One shared backlog (ADR 017):* memory stays bounded however many replicas there are. A replica
+  that falls too far behind gets a fresh full sync.
+- *Diskless fuzzy full sync (ADR 018):* the same idempotency argument as the AOF rewrite.
+  No disk, and clients wait on one slot group at a time.
+- *Only the primary deletes (ADR 019):* the replica's data is always a copy of the primary's
+  history, never a divergent version.
+- *Deterministic fault injection (ADR 020):* the rare failure ("primary dies after acking, before
+  replicating") becomes an ordinary test you can rerun.
+
+**What can go wrong** (this is the point of the iteration)
+- **Asynchronous replication loses acknowledged writes on failover.** Measured: 4 of 2.4M even
+  with a sub-millisecond local replica, and up to 68% of writes on a slow link, where lag reached
+  200k writes.
+- **WAIT shrinks the window but doesn't remove it.** Waiting for 1 replica after each write lost
+  nothing in 20 runs, but cost 35% throughput (366x on the slow link). And:
+  (B) a WAIT that times out leaves the write applied and visible, with no rollback;
+  (C) with two replicas, WAIT 1 can be satisfied by the one that *isn't* promoted, and the
+  "confirmed" write is still lost.
+- **Bugs fault injection caught while building:** the pause check ran before waiting for data, so
+  one write slipped through. And the test's "crash" released pauses before closing links, so the
+  dying primary still delivered data, which a real crash never does.
+
+**Try it yourself**
+```
+make build
+./bin/shardis --port 7001 &
+./bin/shardis --port 7002 --replicaof "127.0.0.1 7001" &
+redis-cli -p 7001 set k v; redis-cli -p 7002 get k     # "v"
+redis-cli -p 7002 set x y                              # READONLY You can't write against a read only replica.
+redis-cli -p 7001 wait 1 1000                          # 1
+redis-cli -p 7001 info replication                     # slave0:...,offset=...,lag=0
+./bin/shardis --port 7003 --enable-fault-injection yes &   # then: FAULT SET repl.stream pause
+./bin/shardis-crashtest -failover plain,wait -runs 3   # the lost-write table, quick
+```
+
+**Interview question you can now answer**
+*"Can Redis lose a write it acknowledged? What does WAIT change?"*
+"Yes. Replication is asynchronous: the primary says OK before any replica has the write. If it
+dies in that gap and a replica takes over, the write is gone. I reproduced it on purpose with
+fault injection, and measured it: 4 out of 2.4 million writes even with a local replica, and up
+to two-thirds of writes when the replica lagged on a slow link. WAIT makes the client wait until
+N replicas have its writes. In my tests that took losses to zero, but it cost 35% throughput, and
+it isn't synchronous replication: if WAIT times out, the write is still applied, and with two
+replicas WAIT 1 can be satisfied by the replica that doesn't get promoted. So the real fixes are
+monitoring lag and having the failover pick the most up-to-date replica."
+
+**Check yourself**
+1. Why does a replica that reconnects after a 2-second blip usually *not* need a full copy?
+<details><summary>Answer</summary>The primary keeps the last 64 MB of the stream in its backlog, with every byte numbered by offset. The replica says "I have everything up to offset X of history Y". If X is still in the backlog, the primary sends just the bytes after X (a partial resync). A full copy is only needed if the replica missed more than the backlog holds, or is on a different history.</details>
+
+2. In Demo C, WAIT 1 returned 1 and the write was still lost. What would have prevented it?
+<details><summary>Answer</summary>Either wait for all replicas (WAIT 2), so every candidate for promotion has the write, or make the failover promote the most up-to-date replica, the one with the highest replication offset. Redis Cluster does the second, roughly, by giving the replica with the highest offset the shortest election delay. That's coming in Iteration 9.</details>

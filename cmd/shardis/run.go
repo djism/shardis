@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/djism/shardis/internal/config"
 	"github.com/djism/shardis/internal/events"
+	"github.com/djism/shardis/internal/faults"
 	"github.com/djism/shardis/internal/persist"
+	"github.com/djism/shardis/internal/replication"
 	"github.com/djism/shardis/internal/server"
 	"github.com/djism/shardis/internal/store"
 )
@@ -71,7 +76,38 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 		slog.Warn("maxmemory is below 32 MB; the hash-slot maps alone use ~9-14 MB", "maxmemory", cfg.MaxMemory)
 	}
 
-	srv := server.New(server.Options{Log: slog.Default(), Engine: engine, Evictor: evictor, AOF: aof, Hz: cfg.Hz})
+	// Replication: every node can be a primary (replicas connect with PSYNC)
+	// and can become a replica with REPLICAOF. The node feeds the engine's
+	// effects to the AOF and to the replication backlog.
+	var reg *faults.Registry
+	if cfg.EnableFaultInjection {
+		reg = faults.New()
+		slog.Warn("FAULT INJECTION ENABLED: the FAULT command can break replication on purpose (testing only)")
+	}
+	var aofLog store.Log
+	if aof != nil {
+		aofLog = aof
+	}
+	repl := replication.NewNode(replication.Options{
+		Engine: engine, AOF: aofLog, BacklogSize: cfg.ReplBacklogSize,
+		PingPeriod:   time.Duration(cfg.ReplPingMs) * time.Millisecond,
+		Timeout:      time.Duration(cfg.ReplTimeoutMs) * time.Millisecond,
+		AnnouncePort: cfg.Port, Faults: reg, Bus: bus, Log: slog.Default(),
+	})
+	defer repl.Close() // runs before aof.Close (defers are last-in-first-out)
+	if cfg.ReplicaOf != "" {
+		f := strings.Fields(cfg.ReplicaOf)
+		port, err := strconv.Atoi(f[1])
+		if err != nil {
+			return fmt.Errorf("replicaof: bad port %q", f[1])
+		}
+		if err := repl.ReplicaOf(f[0], port); err != nil {
+			return err
+		}
+	}
+
+	srv := server.New(server.Options{Log: slog.Default(), Engine: engine, Evictor: evictor, AOF: aof,
+		Repl: repl, Faults: reg, Port: cfg.Port, Hz: cfg.Hz})
 	if err := srv.Listen(addr); err != nil {
 		return err
 	}

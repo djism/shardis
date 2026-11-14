@@ -1,13 +1,11 @@
 package persist
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/djism/shardis/internal/resp"
@@ -82,7 +80,7 @@ func (a *AOF) loadFile(e store.Engine, name string, last bool, st *LoadStats) (i
 		var applyErr error
 		e.DoAll(func(tx *store.Tx) {
 			for _, rec := range batch {
-				if err := applyEffect(tx, rec); err != nil && applyErr == nil {
+				if err := store.ApplyEffect(tx, rec); err != nil && applyErr == nil {
 					applyErr = err
 				}
 			}
@@ -124,44 +122,4 @@ func (a *AOF) loadFile(e store.Engine, name string, last bool, st *LoadStats) (i
 		return 0, fmt.Errorf("aof %s: %w", name, err)
 	}
 	return good, nil
-}
-
-// applyEffect replays one effect record. These are exactly the records the
-// store writes (effects.go). Deadlines are absolute, so a key whose deadline
-// passed while the server was down is simply not loaded.
-func applyEffect(tx *store.Tx, rec [][]byte) error {
-	cmd := string(bytes.ToUpper(rec[0]))
-	switch {
-	case cmd == "SET" && (len(rec) == 3 || len(rec) == 5):
-		var at int64
-		if len(rec) == 5 {
-			n, err := strconv.ParseInt(string(rec[4]), 10, 64)
-			if err != nil || !bytes.EqualFold(rec[3], []byte("PXAT")) {
-				return fmt.Errorf("bad SET record")
-			}
-			at = n
-		}
-		if at != 0 && at <= tx.Now() {
-			tx.Delete(rec[1]) // expired while we were down
-			return nil
-		}
-		tx.SetWithExpire(rec[1], rec[2], at)
-	case cmd == "DEL" && len(rec) >= 2:
-		for _, k := range rec[1:] {
-			tx.Delete(k)
-		}
-	case cmd == "PEXPIREAT" && len(rec) == 3:
-		at, err := strconv.ParseInt(string(rec[2]), 10, 64)
-		if err != nil {
-			return fmt.Errorf("bad PEXPIREAT record")
-		}
-		tx.SetExpire(rec[1], max(at, 1)) // a past deadline deletes the key
-	case cmd == "PERSIST" && len(rec) == 2:
-		tx.SetExpire(rec[1], 0)
-	case cmd == "FLUSHALL" && len(rec) == 1:
-		tx.Flush()
-	default:
-		return fmt.Errorf("unknown AOF record %q with %d args", rec[0], len(rec))
-	}
-	return nil
 }

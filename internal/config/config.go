@@ -46,6 +46,13 @@ type Config struct {
 	AutoAOFRewritePercent int
 	AutoAOFRewriteMinSize int64
 	DebugRecordSynced     bool // fault injection for the crash test; never in production
+
+	// Replication (ADR 017-020).
+	ReplicaOf            string // "host port" to start as a replica, "" = primary
+	ReplBacklogSize      int64
+	ReplPingMs           int // primary → replica heartbeat period
+	ReplTimeoutMs        int // a silent link is dead after this long
+	EnableFaultInjection bool
 }
 
 // Load builds a Config from args (usually os.Args[1:]) and getenv (usually os.Getenv).
@@ -80,6 +87,16 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	}
 	str(fs, getenv, &rewriteMin, "auto-aof-rewrite-min-size", "64mb", "don't auto-rewrite an AOF smaller than this")
 	str(fs, getenv, &recordSynced, "debug-record-synced", "no", "FAULT INJECTION (crash test only): record fsynced AOF length")
+	var backlog, faultsOn string
+	str(fs, getenv, &cfg.ReplicaOf, "replicaof", "", `start as a replica of "host port"`)
+	str(fs, getenv, &backlog, "repl-backlog-size", "64mb", "replication backlog (how far behind a replica can be and still partially resync)")
+	if err := integer(fs, getenv, &cfg.ReplPingMs, "repl-ping-ms", 1000, "primary heartbeat period in the replication stream (ms)"); err != nil {
+		return Config{}, err
+	}
+	if err := integer(fs, getenv, &cfg.ReplTimeoutMs, "repl-timeout-ms", 10000, "replication link timeout (ms)"); err != nil {
+		return Config{}, err
+	}
+	str(fs, getenv, &faultsOn, "enable-fault-injection", "no", "enable the FAULT admin command (testing only)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -99,6 +116,15 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	}
 	if cfg.DebugRecordSynced, err = yesNo("debug-record-synced", recordSynced); err != nil {
 		return Config{}, err
+	}
+	if cfg.ReplBacklogSize, err = ParseMemory(backlog); err != nil {
+		return Config{}, err
+	}
+	if cfg.EnableFaultInjection, err = yesNo("enable-fault-injection", faultsOn); err != nil {
+		return Config{}, err
+	}
+	if cfg.ReplicaOf != "" && len(strings.Fields(cfg.ReplicaOf)) != 2 {
+		return Config{}, fmt.Errorf(`replicaof: want "host port", got %q`, cfg.ReplicaOf)
 	}
 	if cfg.Hz < 1 || cfg.Hz > 500 { // Redis's allowed range
 		return Config{}, fmt.Errorf("hz %d out of range 1-500", cfg.Hz)

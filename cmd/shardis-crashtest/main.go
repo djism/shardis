@@ -19,6 +19,12 @@
 //	         them; we assume none.)
 //
 //	shardis-crashtest -runs 10 -policies off,no,everysec,always -modes process,power
+//
+// With -failover it instead measures replication's lost-write window: kill
+// the primary, promote its replica, count acknowledged writes the replica
+// lacks (see failover.go).
+//
+//	shardis-crashtest -failover plain,wait,slowlink,slowlink+wait -runs 10
 package main
 
 import (
@@ -60,8 +66,13 @@ func main() {
 	flag.IntVar(&o.writers, "writers", 16, "concurrent writers")
 	flag.DurationVar(&o.minLoad, "min-load", 1500*time.Millisecond, "shortest time under load before the crash")
 	flag.DurationVar(&o.maxLoad, "max-load", 3*time.Second, "longest time under load before the crash")
+	failover := flag.String("failover", "", "replication failover test instead: variants plain,wait,slowlink,slowlink+wait")
 	flag.Parse()
 	o.policies, o.modes = strings.Split(policies, ","), strings.Split(modes, ",")
+	if *failover != "" {
+		runFailover(o, strings.Split(*failover, ","))
+		return
+	}
 
 	fmt.Println("policy,mode,run,load_s,acked,lost,lost_pct,acked_writes_per_s,unacked_but_present")
 	for _, mode := range o.modes {

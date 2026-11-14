@@ -44,6 +44,15 @@ func (s *Server) commandTable() map[string]command {
 		// persistence (cmd_persist.go)
 		"bgrewriteaof": {arity: 1, run: cmdBgRewriteAOF},
 
+		// replication (cmd_repl.go)
+		"replicaof": {arity: 3, run: cmdReplicaOf},
+		"slaveof":   {arity: 3, run: cmdReplicaOf},
+		"replconf":  {arity: -1, run: cmdReplConf},
+		"psync":     {arity: 3, run: cmdPSync},
+		"wait":      {arity: 3, run: cmdWait},
+		"role":      {arity: 1, run: cmdRole},
+		"fault":     {arity: -2, run: cmdFault},
+
 		// strings (cmd_strings.go)
 		"get":    {arity: 2, run: cmdGet},
 		"set":    {arity: -3, flags: wd, run: cmdSet},
@@ -87,6 +96,10 @@ func (s *Server) dispatch(cl *client, args [][]byte) {
 		return
 	}
 	cl.cmds.Add(1)
+	if cmd.flags&flagWrite != 0 && s.repl != nil && s.repl.IsReplica() {
+		cl.w.WriteError("READONLY You can't write against a read only replica.")
+		return
+	}
 	if cmd.flags&flagWrite != 0 && s.aof != nil {
 		// Once the AOF has failed (disk full, I/O error), refuse writes:
 		// we couldn't make them durable. Like Redis's MISCONF error.

@@ -15,18 +15,23 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/djism/shardis/internal/faults"
 	"github.com/djism/shardis/internal/persist"
+	"github.com/djism/shardis/internal/replication"
 	"github.com/djism/shardis/internal/resp"
 	"github.com/djism/shardis/internal/store"
 )
 
 // Options configures a Server. Engine is required.
 type Options struct {
-	Log     *slog.Logger   // nil = discard
-	Engine  store.Engine   // the caller owns it and closes it after Serve returns
-	Evictor *store.Evictor // nil = no memory limit
-	AOF     *persist.AOF   // nil = no persistence; the caller closes it after Serve returns
-	Hz      int            // for INFO and CONFIG GET hz
+	Log     *slog.Logger      // nil = discard
+	Engine  store.Engine      // the caller owns it and closes it after Serve returns
+	Evictor *store.Evictor    // nil = no memory limit
+	AOF     *persist.AOF      // nil = no persistence; the caller closes it after Serve returns
+	Repl    *replication.Node // nil = no replication (tests); the caller closes it
+	Faults  *faults.Registry  // nil = FAULT command disabled (the default)
+	Port    int               // our client port, for INFO
+	Hz      int               // for INFO and CONFIG GET hz
 }
 
 type Server struct {
@@ -34,6 +39,8 @@ type Server struct {
 	engine   store.Engine
 	evictor  *store.Evictor
 	aof      *persist.AOF
+	repl     *replication.Node
+	faults   *faults.Registry
 	hz       int
 	commands map[string]command
 	started  time.Time
@@ -56,7 +63,7 @@ func New(opts Options) *Server {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{
-		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, hz: opts.Hz,
+		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, repl: opts.Repl, faults: opts.Faults, hz: opts.Hz,
 		conns: make(map[net.Conn]*client), started: time.Now(),
 	}
 	s.commands = s.commandTable()
@@ -159,6 +166,12 @@ type client struct {
 	w    *resp.Writer
 	quit bool // set by QUIT: flush the reply, then hang up
 
+	// replPort is the port a replica announced with REPLCONF listening-port.
+	replPort int
+	// takeover, set by PSYNC, turns the connection into a replication link
+	// after the current command.
+	takeover func(net.Conn, *resp.Reader)
+
 	// needDurable is set after a write command; the next bytes sent to the
 	// socket wait for the AOF first (durableConn).
 	needDurable bool
@@ -197,6 +210,14 @@ func (s *Server) handle(c net.Conn) {
 		if cl.quit {
 			w.Flush()
 			log.Debug("conn quit")
+			return
+		}
+		if cl.takeover != nil {
+			// PSYNC: this connection is now a replication link. Send any
+			// pending replies, then hand over the raw connection.
+			if w.Flush() == nil {
+				cl.takeover(c, r)
+			}
 			return
 		}
 	}

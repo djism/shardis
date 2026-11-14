@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bytes"
+	"fmt"
 	"strconv"
 	"sync/atomic"
 )
@@ -147,4 +149,92 @@ func (t *Tx) AppendSnapshot(dst []byte, slots []uint16) []byte {
 		}
 	}
 	return dst
+}
+
+// Tee returns a Log that appends to every non-nil log, in order. The
+// primary uses it to feed the same effects to its AOF and to replicas.
+func Tee(logs ...Log) Log {
+	var out multiLog
+	for _, l := range logs {
+		if l != nil {
+			out = append(out, l)
+		}
+	}
+	switch len(out) {
+	case 0:
+		return nil
+	case 1:
+		return out[0]
+	}
+	return out
+}
+
+type multiLog []Log
+
+func (m multiLog) Append(p []byte) {
+	for _, l := range m {
+		l.Append(p)
+	}
+}
+
+// EffectKeys returns the keys an effect record touches, for Engine.Do.
+// all is true for records that touch everything (FLUSHALL): use DoAll.
+func EffectKeys(rec [][]byte) (keys [][]byte, all bool) {
+	switch string(bytes.ToUpper(rec[0])) {
+	case "FLUSHALL":
+		return nil, true
+	case "DEL":
+		return rec[1:], false
+	}
+	if len(rec) < 2 {
+		return nil, false
+	}
+	return rec[1:2], false
+}
+
+// ApplyEffect replays one effect record (the records effects.go writes).
+// The AOF loader and replicas both use it, so a replayed log and a replica
+// end up in exactly the state the primary had.
+//
+// Deadlines are absolute: a SET whose deadline has passed is not stored.
+// DEL removes the key even if it has (logically) expired: on a replica,
+// expired keys are hidden but kept until the primary's DEL arrives (ADR 019).
+func ApplyEffect(tx *Tx, rec [][]byte) error {
+	if len(rec) == 0 {
+		return fmt.Errorf("empty record")
+	}
+	cmd := string(bytes.ToUpper(rec[0]))
+	switch {
+	case cmd == "SET" && (len(rec) == 3 || len(rec) == 5):
+		var at int64
+		if len(rec) == 5 {
+			n, err := strconv.ParseInt(string(rec[4]), 10, 64)
+			if err != nil || !bytes.EqualFold(rec[3], []byte("PXAT")) {
+				return fmt.Errorf("bad SET record")
+			}
+			at = n
+		}
+		if at != 0 && at <= tx.Now() {
+			tx.Remove(rec[1]) // already expired: same as not having it
+			return nil
+		}
+		tx.SetWithExpire(rec[1], rec[2], at)
+	case cmd == "DEL" && len(rec) >= 2:
+		for _, k := range rec[1:] {
+			tx.Remove(k)
+		}
+	case cmd == "PEXPIREAT" && len(rec) == 3:
+		at, err := strconv.ParseInt(string(rec[2]), 10, 64)
+		if err != nil {
+			return fmt.Errorf("bad PEXPIREAT record")
+		}
+		tx.SetExpire(rec[1], max(at, 1)) // a past deadline deletes the key
+	case cmd == "PERSIST" && len(rec) == 2:
+		tx.SetExpire(rec[1], 0)
+	case cmd == "FLUSHALL" && len(rec) == 1:
+		tx.Flush()
+	default:
+		return fmt.Errorf("unknown effect record %q with %d args", rec[0], len(rec))
+	}
+	return nil
 }

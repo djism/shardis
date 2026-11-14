@@ -27,6 +27,7 @@ var infoSections = []struct {
 	{"clients", infoClients},
 	{"memory", infoMemory},
 	{"persistence", infoPersistence},
+	{"replication", infoReplication},
 	{"stats", infoStats},
 	{"keyspace", infoKeyspace},
 }

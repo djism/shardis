@@ -32,6 +32,8 @@ type Engine interface {
 	// SetLog starts (or, with nil, stops) recording effects to l. Call it
 	// after loading the AOF, so replayed effects aren't logged again.
 	SetLog(l Log)
+	// SetReplicaMode turns replica behavior on or off (ADR 019).
+	SetReplicaMode(on bool)
 
 	keyspace() *keyspace // for the Evictor, which lives in this package
 }

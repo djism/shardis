@@ -23,6 +23,7 @@ package store
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"github.com/djism/shardis/internal/events"
 	"github.com/djism/shardis/internal/keyslot"
@@ -70,6 +71,12 @@ type keyspace struct {
 	// exact is the exact-LRU list, only when the engine was created with
 	// Options.ExactLRU (it costs memory and a global lock; see ADR 012).
 	exact *exactLRU
+
+	// replica is true while this node replicates from a primary (ADR 019):
+	// expired keys are hidden from reads but not deleted, and active expiry
+	// is off. Only the primary's DEL removes them, so the replica can never
+	// disagree with the primary about which keys exist.
+	replica atomic.Bool
 }
 
 // Maps smaller than this aren't worth rebuilding.
@@ -150,7 +157,9 @@ func (t *Tx) lookup(key []byte) (uint16, entry, bool) {
 		return s, entry{}, false
 	}
 	if e.expiredAt(t.now) {
-		t.expire(s, string(key), "lazy")
+		if !t.ks.replica.Load() { // replicas hide it and wait for the primary's DEL
+			t.expire(s, string(key), "lazy")
+		}
 		return s, entry{}, false
 	}
 	if sec := t.nowSec(); e.lru != sec { // at most one map write per key per second
@@ -251,6 +260,20 @@ func (t *Tx) Delete(key []byte) bool {
 	}
 	t.remove(s, string(key))
 	t.recordDel(string(key))
+	t.emitWrite("del", key, s)
+	return true
+}
+
+// Remove deletes key whether or not it has expired, without counting a
+// hit or miss. Used when replaying the primary's DEL (ApplyEffect).
+func (t *Tx) Remove(key []byte) bool {
+	s := t.slotOf(key)
+	k := string(key)
+	if _, ok := t.ks.slots[s][k]; !ok {
+		return false
+	}
+	t.remove(s, k)
+	t.recordDel(k)
 	t.emitWrite("del", key, s)
 	return true
 }
@@ -410,6 +433,9 @@ func (t *Tx) Flush() {
 // sample. Deleting from a map while ranging over it is allowed in Go.
 func (t *Tx) sampleExpired(s uint16, max int) (sampled, expired int) {
 	t.checkSlot(s)
+	if t.ks.replica.Load() {
+		return 0, 0 // replicas never expire keys themselves (ADR 019)
+	}
 	for k := range t.ks.volatile[s] {
 		if sampled == max {
 			break

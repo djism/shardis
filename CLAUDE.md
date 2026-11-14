@@ -129,10 +129,10 @@ internal/config/      flags + SHARDIS_* env config
 internal/store/       in-memory keyspace (one map per hash slot), engines (sharded locks / executor), expiry, eviction
 internal/keyslot/     CRC16 + hash tags → slot (verified against real Redis)
 internal/persist/     AOF (effects log, group commit, fsync policies), manifest, fuzzy rewrite
-internal/replication/ primary/replica sync
+internal/replication/ PSYNC, backlog, full/partial sync, WAIT, promotion
 internal/cluster/     slots, cluster bus, gossip, failure detection, failover, resharding
 internal/events/      event bus
-internal/faults/      fault injection hooks
+internal/faults/      deterministic fault injection (FAULT SET repl.stream pause|delay|sever)
 pkg/client/           our own "smart" cluster client
 deploy/compose/       docker-compose 6-node cluster
 deploy/k8s/           Kubernetes manifests (StatefulSet etc.)
@@ -160,6 +160,7 @@ make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* en
                   # --maxmemory 64mb --maxmemory-policy allkeys-lru (ADR 011-013)
                   #   (warns below 32mb: the 16384 slot maps alone use ~9-14 MB)
                   # --appendonly yes --appendfsync everysec --dir /data  (ADR 014-016)
+                  # --replicaof "host port"  --enable-fault-injection yes (testing only)
 SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
 bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
 bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
@@ -169,6 +170,8 @@ bash docs/benchmarks/iter-04-eviction/run.sh      # eviction hit rates vs Redis 
 bin/shardis-loadgen -addr 127.0.0.1:7000          # Zipf cache-aside traffic: hit rate, latency
 bin/shardis-crashtest -runs 10                    # kill -9 / simulated power cut, lost acked writes
 bash docs/benchmarks/iter-05-persistence/run.sh   # crash table + throughput per fsync policy (~10 min)
+bin/shardis-crashtest -failover plain,wait,slowlink,slowlink+wait   # replication lost-write window
+bash docs/benchmarks/iter-06-replication/run.sh   # the full failover table (~4 min)
 ```
 
 macOS note: AirPlay Receiver listens on *:7000. Binding 127.0.0.1:7000 (the default) works;

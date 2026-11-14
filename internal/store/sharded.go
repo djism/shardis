@@ -109,8 +109,9 @@ func (s *sharded) unlockSet(set *shardSet) {
 	}
 }
 
-func (s *sharded) Close()              {}
-func (s *sharded) Name() string        { return EngineSharded }
-func (s *sharded) Stats() Stats        { return s.ks.stats() }
-func (s *sharded) SetLog(l Log)        { s.log.set(l) }
-func (s *sharded) keyspace() *keyspace { return s.ks }
+func (s *sharded) Close()                 {}
+func (s *sharded) Name() string           { return EngineSharded }
+func (s *sharded) Stats() Stats           { return s.ks.stats() }
+func (s *sharded) SetLog(l Log)           { s.log.set(l) }
+func (s *sharded) SetReplicaMode(on bool) { s.ks.replica.Store(on) }
+func (s *sharded) keyspace() *keyspace    { return s.ks }

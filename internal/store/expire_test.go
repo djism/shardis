@@ -367,3 +367,69 @@ func TestMemoryShrinksAfterMassDelete(t *testing.T) {
 		t.Fatalf("compaction freed less than half (%.1f → %.1f MB)", float64(before)/(1<<20), float64(after)/(1<<20))
 	}
 }
+
+// On a replica, expired keys are hidden from reads but stay stored until the
+// primary's DEL arrives; active expiry does nothing (ADR 019).
+func TestReplicaModeHidesButKeepsExpiredKeys(t *testing.T) {
+	forEachEngineWithClock(t, func(t *testing.T, e Engine, clk *fakeClock) {
+		e.SetReplicaMode(true)
+		k := b("k")
+		e.Do([][]byte{k}, func(tx *Tx) { tx.SetWithExpire(k, b("v"), clk.In(time.Second)) })
+		clk.Advance(2 * time.Second)
+		e.Do([][]byte{k}, func(tx *Tx) {
+			if _, ok := tx.Get(k); ok {
+				t.Error("replica returned an expired key")
+			}
+		})
+		NewActiveExpirer(e, 10).Cycle(time.Second)
+		if dbsize(e) != 1 {
+			t.Fatal("replica deleted an expired key on its own")
+		}
+		// The primary's DEL removes it.
+		e.Do([][]byte{k}, func(tx *Tx) {
+			if err := ApplyEffect(tx, [][]byte{b("DEL"), k}); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if dbsize(e) != 0 {
+			t.Fatal("DEL from the primary didn't remove the expired key")
+		}
+		e.SetReplicaMode(false) // promoted: back to normal expiry
+		e.Do([][]byte{k}, func(tx *Tx) { tx.SetWithExpire(k, b("v"), clk.In(time.Second)) })
+		clk.Advance(2 * time.Second)
+		NewActiveExpirer(e, 10).Cycle(time.Second)
+		if dbsize(e) != 0 {
+			t.Fatal("primary didn't expire the key")
+		}
+	})
+}
+
+type captureLog struct{ b []byte }
+
+func (c *captureLog) Append(p []byte) { c.b = append(c.b, p...) }
+
+func TestTeeAndEffectRecords(t *testing.T) {
+	a, c := &captureLog{}, &captureLog{}
+	if Tee(nil, nil) != nil || Tee(a) != Log(a) {
+		t.Fatal("Tee of nil / single log")
+	}
+	clk := newFakeClock()
+	e := newSharded(Options{Clock: clk.Now})
+	e.SetLog(Tee(a, nil, c))
+	k := b("x")
+	e.Do([][]byte{k}, func(tx *Tx) {
+		tx.Set(k, b("1"))
+		tx.SetKeepTTL(k, b("2"))
+		tx.SetExpire(k, clk.In(time.Second))
+		tx.SetExpire(k, 0)
+		tx.Delete(k)
+	})
+	want := "*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$1\r\n1\r\n" +
+		"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$1\r\n2\r\n" +
+		"*3\r\n$9\r\nPEXPIREAT\r\n$1\r\nx\r\n$13\r\n1700000001000\r\n" +
+		"*2\r\n$7\r\nPERSIST\r\n$1\r\nx\r\n" +
+		"*2\r\n$3\r\nDEL\r\n$1\r\nx\r\n"
+	if string(a.b) != want || string(c.b) != want {
+		t.Fatalf("effects:\n%q\nwant\n%q", a.b, want)
+	}
+}

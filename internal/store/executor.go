@@ -73,7 +73,8 @@ func (e *executor) Close() {
 	<-e.done
 }
 
-func (e *executor) Name() string        { return EngineExecutor }
-func (e *executor) Stats() Stats        { return e.tx.ks.stats() }
-func (e *executor) SetLog(l Log)        { e.log.set(l) }
-func (e *executor) keyspace() *keyspace { return e.tx.ks }
+func (e *executor) Name() string           { return EngineExecutor }
+func (e *executor) Stats() Stats           { return e.tx.ks.stats() }
+func (e *executor) SetLog(l Log)           { e.log.set(l) }
+func (e *executor) SetReplicaMode(on bool) { e.tx.ks.replica.Store(on) }
+func (e *executor) keyspace() *keyspace    { return e.tx.ks }
