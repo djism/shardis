@@ -1512,6 +1512,8 @@ Each layer links to the next one down, so any claim can be followed to the raw C
   must update them too.
 - **The site link stays dead until GitHub Pages is enabled** (Settings → Pages → Source:
   GitHub Actions). Linking it from djism.github.io is a manual step.
+- **The roadmap asked for a GIF; the README has a still screenshot of the site.** An animated
+  clip of the failover scene is deferred.
 - **Port 7000 on macOS:** the quickstart uses 7001, because AirPlay Receiver owns *:7000 and
   `redis-cli -p 7000` can hang before node a binds.
 
