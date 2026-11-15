@@ -13,6 +13,7 @@ build: ## build binaries into bin/
 	go build -o $(BIN) ./cmd/shardis
 	go build -o bin/shardis-loadgen ./cmd/shardis-loadgen
 	go build -o bin/shardis-crashtest ./cmd/shardis-crashtest
+	go build -o bin/shardis-admin ./cmd/shardis-admin
 
 test: ## run all tests with the race detector
 	go test -race -count=1 $(PKG)
@@ -20,9 +21,10 @@ test: ## run all tests with the race detector
 test-memory: ## heap-measuring tests (skipped under -race in `make test`)
 	go test -count=1 -run 'Memory' ./internal/store
 
-fuzz: ## fuzz the RESP parser (FUZZTIME=60s per target)
+fuzz: ## fuzz the RESP parser and the DUMP payload decoder (FUZZTIME=60s per target)
 	@for f in FuzzReadCommand FuzzReadValue FuzzCommandRoundTrip; do \
 		go test ./internal/resp -run '^$$' -fuzz "^$$f\$$" -fuzztime $${FUZZTIME:-60s} || exit 1; done
+	go test ./internal/store -run '^$$' -fuzz '^FuzzParseDump$$' -fuzztime $${FUZZTIME:-60s}
 
 bench: ## Go microbenchmarks
 	go test -run '^$$' -bench . -benchmem ./...
@@ -40,7 +42,7 @@ lint: vet ## fail if any file is not gofmt-formatted
 	@out=$$(gofmt -l $(GOFILES)); if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
 
 clean: ## remove build output
-	rm -f $(BIN) bin/shardis-loadgen bin/shardis-crashtest
+	rm -f $(BIN) bin/shardis-loadgen bin/shardis-crashtest bin/shardis-admin
 
 cluster-up-local: ## 6-node cluster as local processes on 127.0.0.1:7000-7005
 	deploy/local/cluster.sh up

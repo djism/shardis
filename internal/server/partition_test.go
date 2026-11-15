@@ -110,7 +110,7 @@ func TestPartitionIsolatedPrimary(t *testing.T) {
 
 	// Heal: a must turn into d's replica, and its during-split writes are lost.
 	tc.all(t, "", "FAULT", "HEAL")
-	eventually(t, "a becomes d's replica", func() bool {
+	eventuallyWithin(t, healWait, "a becomes d's replica", func() bool {
 		return strings.HasPrefix(a.do("ROLE"), fmt.Sprintf(`["slave" "127.0.0.1" (int) %d "connected"`, tc.nodes["d"].port))
 	})
 	d.do("READONLY")
@@ -132,6 +132,13 @@ func TestPartitionIsolatedPrimary(t *testing.T) {
 	a.do("READONLY")
 	eventually(t, "a's data now matches d", func() bool { return a.do("GET", tag+":majority") == `"x"` && a.do("GET", tag+":during:0") == "(nil)" })
 }
+
+// healWait bounds recovery after FAULT HEAL: noticing the others are
+// reachable again can take up to a node timeout (2 s here: a PING already
+// pending from the partition has to time out before the link is redialed),
+// then a minority node waits the rejoin delay (another 2 s) before serving.
+// Plus slack for the race detector.
+const healWait = 10 * time.Second
 
 // Scenario B: a is cut off together with its own replica d. The majority
 // can't fail over (no replica on its side), and the minority can't serve
@@ -155,7 +162,7 @@ func TestPartitionPrimaryWithItsReplica(t *testing.T) {
 		t.Fatalf("d was promoted without a majority: %s", role)
 	}
 	tc.all(t, "", "FAULT", "HEAL")
-	eventually(t, "everything back, a still primary", func() bool {
+	eventuallyWithin(t, healWait, "everything back, a still primary", func() bool {
 		return clusterInfoField(t, b, "cluster_state") == "ok" && a.do("GET", ka) == `"v"` && strings.HasPrefix(a.do("ROLE"), `["master"`)
 	})
 }
@@ -173,7 +180,7 @@ func TestPartitionLoneReplica(t *testing.T) {
 		t.Fatalf("majority write = %q", got)
 	}
 	tc.all(t, "", "FAULT", "HEAL")
-	eventually(t, "f catches up", func() bool { return f.do("GET", kc) == `"written-during"` })
+	eventuallyWithin(t, healWait, "f catches up", func() bool { return f.do("GET", kc) == `"written-during"` })
 }
 
 // With cluster-allow-reads-when-down, the minority side keeps serving

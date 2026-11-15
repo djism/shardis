@@ -1,0 +1,268 @@
+package main
+
+import (
+	"fmt"
+	"maps"
+	"net"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type moveOptions struct {
+	batch, timeoutMs int
+	verbose          bool
+	fix              bool // MIGRATE with REPLACE: finishing a crashed run (see fix)
+}
+
+// moveSlot moves one slot from src to dst while clients keep using it. The
+// order of the steps is the whole trick (ADR 032):
+//
+//  1. dst IMPORTING first. If src started sending -ASK before dst was ready,
+//     dst would answer MOVED-back-to-src, and the client would bounce.
+//  2. src MIGRATING: from now on, keys src no longer has get -ASK dst.
+//  3. MIGRATE the keys in batches until the slot is empty on src.
+//  4. dst NODE dst first: dst owns the slot (and bumps its epoch, so its
+//     claim beats src's in gossip). Clients still sent to src get -ASK, and
+//     dst serves them.
+//  5. src NODE dst: src now answers MOVED dst.
+//  6. Every other primary NODE dst, so they stop sending clients to src. (Gossip
+//     would get there too, but this is faster.)
+func moveSlot(v *view, src, dst *node, slot int, o moveOptions) (keys int, err error) {
+	s := strconv.Itoa(slot)
+	sc, err := v.conn(src.addr)
+	if err != nil {
+		return 0, err
+	}
+	dc, err := v.conn(dst.addr)
+	if err != nil {
+		return 0, err
+	}
+	if slices.Contains(dst.slots, slot) {
+		// A run crashed after step 4: dst already owns the slot. Only
+		// steps 5-6 are left.
+		return 0, finishSlot(v, sc, src, dst, s)
+	}
+	if _, err := dc.do("CLUSTER", "SETSLOT", s, "IMPORTING", src.id); err != nil {
+		return 0, err
+	}
+	if _, err := sc.do("CLUSTER", "SETSLOT", s, "MIGRATING", dst.id); err != nil {
+		return 0, err
+	}
+	host, port, _ := net.SplitHostPort(dst.addr)
+	for {
+		kv, err := sc.do("CLUSTER", "GETKEYSINSLOT", s, strconv.Itoa(o.batch))
+		if err != nil {
+			return keys, err
+		}
+		if len(kv.Elems) == 0 {
+			break
+		}
+		args := [][]byte{[]byte("MIGRATE"), []byte(host), []byte(port), {}, []byte("0"), []byte(strconv.Itoa(o.timeoutMs))}
+		if o.fix {
+			args = append(args, []byte("REPLACE"))
+		}
+		args = append(args, []byte("KEYS"))
+		for _, k := range kv.Elems {
+			args = append(args, k.Str)
+		}
+		if _, err := sc.doBytes(args...); err != nil {
+			if strings.Contains(err.Error(), "BUSYKEY") && !o.fix {
+				return keys, fmt.Errorf("slot %d: %w (the target already has some of these keys; run `shardis-admin fix` to overwrite them with the source's copy)", slot, err)
+			}
+			return keys, fmt.Errorf("slot %d: %w", slot, err)
+		}
+		keys += len(kv.Elems)
+	}
+	if _, err := dc.do("CLUSTER", "SETSLOT", s, "NODE", dst.id); err != nil {
+		return keys, err
+	}
+	if err := finishSlot(v, sc, src, dst, s); err != nil {
+		return keys, err
+	}
+	if o.verbose {
+		fmt.Fprintf(os.Stderr, "slot %d: %s -> %s, %d keys\n", slot, src.short(), dst.short(), keys)
+	}
+	return keys, nil
+}
+
+// finishSlot is steps 5 and 6: the source, then everyone else, learn the
+// new owner.
+func finishSlot(v *view, sc *conn, src, dst *node, s string) error {
+	if _, err := sc.do("CLUSTER", "SETSLOT", s, "NODE", dst.id); err != nil {
+		return err
+	}
+	for _, p := range v.primaries {
+		if p == src || p == dst {
+			continue
+		}
+		c, err := v.conn(p.addr)
+		if err != nil {
+			continue // it'll learn by gossip
+		}
+		if _, err := c.do("CLUSTER", "SETSLOT", s, "NODE", dst.id); err != nil && !strings.Contains(err.Error(), "SETSLOT") {
+			v.drop(p.addr) // a network error: reconnect next time
+		}
+	}
+	return nil
+}
+
+type move struct {
+	src, dst *node
+	slot     int
+}
+
+func run(v *view, moves []move, o moveOptions) error {
+	total := 0
+	for i, m := range moves {
+		k, err := moveSlot(v, m.src, m.dst, m.slot, o)
+		total += k
+		if err != nil {
+			return fmt.Errorf("after %d of %d slots: %w", i, len(moves), err)
+		}
+		if !o.verbose && (i+1)%256 == 0 {
+			fmt.Fprintf(os.Stderr, "%d/%d slots moved (%d keys)\n", i+1, len(moves), total)
+		}
+	}
+	fmt.Printf("moved %d slots, %d keys\n", len(moves), total)
+	return nil
+}
+
+// reshard moves n slots from one primary to another.
+func reshard(addr, fromID, toID string, n int, o moveOptions) error {
+	v, err := load(addr)
+	if err != nil {
+		return err
+	}
+	if err := refuseOpenSlots(v); err != nil {
+		return err
+	}
+	if err := v.waitAgreement(30 * time.Second); err != nil {
+		return err
+	}
+	src, err := v.find(fromID)
+	if err != nil {
+		return err
+	}
+	dst, err := v.find(toID)
+	if err != nil {
+		return err
+	}
+	if n <= 0 || n > len(src.slots) {
+		return fmt.Errorf("-slots must be 1..%d (what %s owns)", len(src.slots), src.short())
+	}
+	var moves []move
+	for _, s := range src.slots[len(src.slots)-n:] {
+		moves = append(moves, move{src, dst, s})
+	}
+	return run(v, moves, o)
+}
+
+// rebalance gives every primary (empty ones included) an equal share of the
+// 16384 slots, moving as few slots as possible: primaries above their share
+// give their highest slots to primaries below it.
+func rebalance(addr string, o moveOptions) error {
+	v, err := load(addr)
+	if err != nil {
+		return err
+	}
+	if err := refuseOpenSlots(v); err != nil {
+		return err
+	}
+	if err := v.waitAgreement(30 * time.Second); err != nil {
+		return err
+	}
+	moves := plan(v.primaries)
+	if len(moves) == 0 {
+		fmt.Println("already balanced")
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "moving %d slots across %d primaries\n", len(moves), len(v.primaries))
+	return run(v, moves, o)
+}
+
+// plan computes the moves for rebalance. A pure function (no network), so
+// it's unit-tested on its own.
+func plan(primaries []*node) []move {
+	ps := slices.Clone(primaries)
+	slices.SortFunc(ps, func(a, b *node) int { return strings.Compare(a.id, b.id) })
+	want := map[*node]int{}
+	for i, p := range ps {
+		want[p] = 16384 / len(ps)
+		if i < 16384%len(ps) {
+			want[p]++
+		}
+	}
+	owned := map[*node][]int{}
+	for _, p := range ps {
+		owned[p] = slices.Clone(p.slots)
+	}
+	var moves []move
+	for _, dst := range ps {
+		for len(owned[dst]) < want[dst] {
+			// Take from whoever is furthest above their share.
+			var src *node
+			for _, p := range ps {
+				if len(owned[p]) > want[p] && (src == nil || len(owned[p])-want[p] > len(owned[src])-want[src]) {
+					src = p
+				}
+			}
+			if src == nil {
+				break
+			}
+			last := owned[src][len(owned[src])-1]
+			owned[src] = owned[src][:len(owned[src])-1]
+			owned[dst] = append(owned[dst], last)
+			moves = append(moves, move{src, dst, last})
+		}
+	}
+	return moves
+}
+
+func refuseOpenSlots(v *view) error {
+	for _, p := range v.primaries {
+		if len(p.migrating)+len(p.importing) > 0 {
+			return fmt.Errorf("%s has slots half-moved (a previous run was interrupted): run `shardis-admin fix` first", p.short())
+		}
+	}
+	return nil
+}
+
+// fix finishes every half-moved slot. A slot is "open" if its owner is
+// MIGRATING it or some node is IMPORTING it. We finish the move toward the
+// node that was importing (or the migration target): keys left on the
+// source are moved with REPLACE, because the source's copy is the newest. While
+// the slot was MIGRATING, the source served every key it still had, so a
+// copy the target holds from an interrupted MIGRATE can only be older.
+func fix(addr string, o moveOptions) error {
+	v, err := load(addr)
+	if err != nil {
+		return err
+	}
+	type open struct{ src, dst *node }
+	slotsOpen := map[int]open{}
+	for _, p := range v.primaries {
+		for s, id := range p.migrating {
+			if dst := v.byID[id]; dst != nil {
+				slotsOpen[s] = open{p, dst}
+			}
+		}
+		for s, id := range p.importing {
+			if src := v.byID[id]; src != nil {
+				slotsOpen[s] = open{src, p}
+			}
+		}
+	}
+	if len(slotsOpen) == 0 {
+		fmt.Println("no open slots")
+		return nil
+	}
+	var moves []move
+	for _, s := range slices.Sorted(maps.Keys(slotsOpen)) {
+		moves = append(moves, move{slotsOpen[s].src, slotsOpen[s].dst, s})
+	}
+	fmt.Fprintf(os.Stderr, "finishing %d half-moved slot(s)\n", len(moves))
+	return run(v, moves, o)
+}

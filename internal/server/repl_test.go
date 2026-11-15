@@ -94,7 +94,12 @@ func replicate(t *testing.T, r, p *replNode) {
 
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	eventuallyWithin(t, 5*time.Second, what, cond)
+}
+
+func eventuallyWithin(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for: %s", what)

@@ -8,6 +8,12 @@
 // right keys.
 //
 //	shardis-loadgen -addr 127.0.0.1:7000 -keys 1000000 -theta 0.99 -duration 20s
+//
+// With -cluster it talks to a whole cluster through pkg/client (following
+// MOVED and ASK), and -timeline writes per-interval throughput, errors,
+// redirects and latency to a CSV, to watch a resharding or failover happen:
+//
+//	shardis-loadgen -cluster -addr 127.0.0.1:7000 -timeline 100ms -timeline-file t.csv
 package main
 
 import (
@@ -23,6 +29,7 @@ import (
 	"time"
 
 	"github.com/djism/shardis/internal/resp"
+	"github.com/djism/shardis/pkg/client"
 )
 
 type options struct {
@@ -36,6 +43,10 @@ type options struct {
 	label     string
 	csv       bool
 	seed      uint64
+	cluster   bool
+	every     time.Duration // timeline interval (0 = no timeline)
+	tlFile    string
+	preload   bool // SET every key once before starting (a full cache)
 }
 
 func main() {
@@ -51,6 +62,10 @@ func main() {
 	flag.BoolVar(&o.csv, "csv", false, "print one CSV row (with -csv-header for the header)")
 	header := flag.Bool("csv-header", false, "print the CSV header and exit")
 	flag.Uint64Var(&o.seed, "seed", 1, "random seed (same seed = same request sequence per worker)")
+	flag.BoolVar(&o.cluster, "cluster", false, "cluster mode: -addr is any node; follow MOVED/ASK with pkg/client")
+	flag.DurationVar(&o.every, "timeline", 0, "write a per-interval timeline (e.g. 100ms) to -timeline-file")
+	flag.StringVar(&o.tlFile, "timeline-file", "timeline.csv", "where -timeline goes")
+	flag.BoolVar(&o.preload, "preload", false, "SET every key once before starting")
 	flag.Parse()
 	if *header {
 		fmt.Println(csvHeader)
@@ -96,6 +111,7 @@ func (c *counts) merge(o *counts) {
 
 type result struct {
 	counts
+	moved, ask   int64 // cluster mode: redirects the client followed
 	elapsed      time.Duration
 	residentKeys int64
 	evicted      int64
@@ -106,7 +122,29 @@ type result struct {
 func run(o options) (*result, error) {
 	base := newZipf(o.keys, o.theta, rand.New(rand.NewPCG(o.seed, 0)))
 	value := []byte(strings.Repeat("v", o.valueSize))
+	var cc *client.Cluster
+	if o.cluster {
+		var err error
+		if cc, err = client.NewCluster([]string{o.addr}, client.Options{PoolSize: o.clients}); err != nil {
+			return nil, err
+		}
+		defer cc.Close()
+	}
+	if o.preload {
+		if err := preload(o, cc, value); err != nil {
+			return nil, err
+		}
+	}
 	start := time.Now()
+	var tl *timeline
+	if o.every > 0 {
+		tl = newTimeline(start, o.every, o.warmup+o.duration)
+		if cc != nil {
+			stop := make(chan struct{})
+			defer close(stop)
+			go tl.sampleRedirects(&cc.Stats, stop)
+		}
+	}
 	measureFrom := start.Add(o.warmup)
 	end := measureFrom.Add(o.duration)
 
@@ -116,7 +154,7 @@ func run(o options) (*result, error) {
 	errc := make(chan error, o.clients)
 	for w := range o.clients {
 		wg.Go(func() {
-			c, firstErr, err := worker(o, base.copy(rand.New(rand.NewPCG(o.seed, uint64(w)+1))), value, measureFrom, end)
+			c, firstErr, err := worker(o, cc, tl, base.copy(rand.New(rand.NewPCG(o.seed, uint64(w)+1))), value, measureFrom, end)
 			if err != nil {
 				errc <- err
 				return
@@ -135,25 +173,90 @@ func run(o options) (*result, error) {
 		return nil, err
 	}
 	total.elapsed = o.duration
+	if tl != nil {
+		f, err := os.Create(o.tlFile)
+		if err != nil {
+			return nil, err
+		}
+		tl.write(f, end)
+		f.Close()
+	}
+	if cc != nil {
+		total.moved, total.ask = cc.Stats.Moved.Load(), cc.Stats.Ask.Load()
+		return total, nil // DBSIZE/INFO of one node would mislead
+	}
 	total.residentKeys, total.evicted, total.usedMemory = serverStats(o.addr)
 	return total, nil
 }
 
-func worker(o options, z *zipf, value []byte, measureFrom, end time.Time) (*counts, string, error) {
+// preload SETs every key once (64 workers in parallel), so the run
+// starts with a full cache (and a resharding has real data to move).
+func preload(o options, cc *client.Cluster, value []byte) error {
+	var wg sync.WaitGroup
+	errc := make(chan error, 64)
+	for w := range uint64(64) {
+		wg.Go(func() {
+			do, closeFn, err := connect(o, cc)
+			if err != nil {
+				errc <- err
+				return
+			}
+			defer closeFn()
+			for r := w; r < o.keys; r += 64 {
+				if v, err := do([]byte("SET"), keyName(r), value); err != nil || v.Kind == resp.Error {
+					errc <- fmt.Errorf("preload SET: %v %s", err, v.Str)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errc)
+	return <-errc
+}
+
+// connect returns a function that runs one command: through the cluster
+// client, or on a dedicated connection to a single server.
+func connect(o options, cc *client.Cluster) (func(args ...[]byte) (resp.Value, error), func(), error) {
+	if cc != nil {
+		return cc.Do, func() {}, nil
+	}
 	conn, err := net.Dial("tcp", o.addr)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
 	}
-	defer conn.Close()
 	w, r := resp.NewWriter(conn), resp.NewReader(conn)
-	do := func(args ...[]byte) (resp.Value, error) {
+	return func(args ...[]byte) (resp.Value, error) {
 		w.WriteCommand(args...)
 		if err := w.Flush(); err != nil {
 			return resp.Value{}, err
 		}
 		return r.ReadValue()
+	}, func() { conn.Close() }, nil
+}
+
+func worker(o options, cc *client.Cluster, tl *timeline, z *zipf, value []byte, measureFrom, end time.Time) (*counts, string, error) {
+	rawDo, closeFn, err := connect(o, cc)
+	if err != nil {
+		return nil, "", err
 	}
+	defer closeFn()
 	c := &counts{}
+	// Every command goes on the timeline. In cluster mode a failed command
+	// (network error, redirects exhausted) is counted, not fatal: the point
+	// is to see errors during a resharding, if there are any.
+	do := func(args ...[]byte) (resp.Value, error) {
+		t0 := time.Now()
+		v, err := rawDo(args...)
+		now := time.Now()
+		failed := err != nil || v.Kind == resp.Error
+		tl.record(now, now.Sub(t0), failed)
+		if err != nil && cc != nil {
+			time.Sleep(time.Millisecond) // the caller counts it as an error reply
+			return resp.Value{Kind: resp.Error, Str: []byte(err.Error())}, nil
+		}
+		return v, err
+	}
 	var firstErr string
 	get, set := []byte("GET"), []byte("SET")
 	for {
@@ -170,6 +273,15 @@ func worker(o options, z *zipf, value []byte, measureFrom, end time.Time) (*coun
 		}
 		if measuring {
 			c.lat.record(time.Since(t0))
+		}
+		if v.Kind == resp.Error {
+			if measuring {
+				c.errors++
+			}
+			if firstErr == "" {
+				firstErr = string(v.Str)
+			}
+			continue
 		}
 		if !v.Null {
 			if measuring {
@@ -258,9 +370,14 @@ func (r *result) human(o options) string {
 	fmt.Fprintf(&b, "hit rate: %.2f%% (%d hits, %d misses)\n", 100*r.hitRate(), r.hits, r.misses)
 	fmt.Fprintf(&b, "GET latency: p50 %.3f ms, p99 %.3f ms, p99.9 %.3f ms\n",
 		ms(r.lat.quantile(0.5)), ms(r.lat.quantile(0.99)), ms(r.lat.quantile(0.999)))
-	fmt.Fprintf(&b, "server:   %d keys resident, %d evicted, used_memory %d\n", r.residentKeys, r.evicted, r.usedMemory)
+	if !o.cluster { // in cluster mode one node's numbers would mislead
+		fmt.Fprintf(&b, "server:   %d keys resident, %d evicted, used_memory %d\n", r.residentKeys, r.evicted, r.usedMemory)
+	}
 	if r.errors > 0 {
-		fmt.Fprintf(&b, "errors:   %d SETs failed, first: %s\n", r.errors, r.firstError)
+		fmt.Fprintf(&b, "errors:   %d commands failed, first: %s\n", r.errors, r.firstError)
+	}
+	if o.cluster {
+		fmt.Fprintf(&b, "cluster:  followed %d MOVED and %d ASK redirects\n", r.moved, r.ask)
 	}
 	return b.String()
 }

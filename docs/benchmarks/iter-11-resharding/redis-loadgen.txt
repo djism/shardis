@@ -1,0 +1,5 @@
+workload: 1000000 keys, zipf theta=0.99, 100-byte values, 50 clients, 45s measured after 0s warmup
+GETs:     6614113 (146980/s)
+hit rate: 100.00% (6614113 hits, 0 misses)
+GET latency: p50 0.272 ms, p99 1.472 ms, p99.9 3.328 ms
+cluster:  followed 66 MOVED and 0 ASK redirects

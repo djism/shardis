@@ -1,0 +1,4 @@
+5d1ed877 127.0.0.1:7100   4096 slots  1 replica(s)
+6d79eb99 127.0.0.1:7106   4096 slots  0 replica(s)
+96d2e517 127.0.0.1:7101   4096 slots  1 replica(s)
+c3c32447 127.0.0.1:7102   4096 slots  1 replica(s)

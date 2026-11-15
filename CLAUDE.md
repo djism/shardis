@@ -123,17 +123,18 @@ cmd/shardis-loadgen/  Zipf "cache-aside" load generator (hit rate, latency)
 cmd/shardis-crashtest/ crash a real server mid-load, count lost acknowledged writes
 cmd/shardis-observer/ streams cluster events over WebSocket for the website
 cmd/shardis-chaos/    runs chaos scenarios + consistency checker, records traces
+cmd/shardis-admin/    add-node / reshard / rebalance / remove-node / fix (live slot migration)
 internal/resp/        protocol parser/writer
 internal/server/      TCP listener, per-connection loop, command table
 internal/config/      flags + SHARDIS_* env config
-internal/store/       in-memory keyspace (one map per hash slot), engines (sharded locks / executor), expiry, eviction
+internal/store/       in-memory keyspace (one map per hash slot), engines (sharded locks / executor), expiry, eviction, DUMP format
 internal/keyslot/     CRC16 + hash tags → slot (verified against real Redis)
 internal/persist/     AOF (effects log, group commit, fsync policies), manifest, fuzzy rewrite
 internal/replication/ PSYNC, backlog, full/partial sync, WAIT, promotion
 internal/cluster/     topology snapshots, cluster bus (wire, gossip), failure detection + failover, nodes.conf
 internal/events/      event bus
 internal/faults/      deterministic fault injection (FAULT SET repl.stream pause|delay|sever)
-pkg/client/           our own "smart" cluster client
+pkg/client/           our own "smart" cluster client (slot map, MOVED, ASK; more in Iteration 12)
 deploy/local/         6-node cluster as local processes (cluster.sh, topology.conf)
 deploy/compose/       docker-compose 6-node cluster (Dockerfile at repo root)
 deploy/k8s/           Kubernetes manifests (StatefulSet etc.)
@@ -148,12 +149,12 @@ ROADMAP.md            iteration plan
 
 ```
 make help         # list all targets
-make build        # build binaries (bin/shardis, bin/shardis-loadgen, bin/shardis-crashtest)
+make build        # build binaries (bin/shardis, bin/shardis-loadgen, bin/shardis-crashtest, bin/shardis-admin)
 make test         # go test -race ./...
 make test-memory  # heap-measuring tests (skipped under -race; CI runs both)
 make lint         # go vet + gofmt check (what CI runs first)
 make fmt          # format all Go code
-make fuzz         # fuzz the RESP parser (FUZZTIME=60s per target)
+make fuzz         # fuzz the RESP parser + DUMP decoder (FUZZTIME=60s per target)
 make bench        # Go microbenchmarks
 make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* env > default)
                   # --engine sharded (default) | executor   (ADR 005)
@@ -175,6 +176,8 @@ bash docs/benchmarks/iter-02-concurrency/gc.sh    # memory per key + GC pauses w
 bash docs/benchmarks/iter-03-expiry/storm.sh      # 1M-key expiry storm vs Redis (~2 min)
 bash docs/benchmarks/iter-04-eviction/run.sh      # eviction hit rates vs Redis (~8 min)
 bin/shardis-loadgen -addr 127.0.0.1:7000          # Zipf cache-aside traffic: hit rate, latency
+bin/shardis-loadgen -cluster -addr 127.0.0.1:7000 -preload -timeline 100ms -timeline-file t.csv
+                                                  # whole cluster via pkg/client; per-100ms timeline
 bin/shardis-crashtest -runs 10                    # kill -9 / simulated power cut, lost acked writes
 bash docs/benchmarks/iter-05-persistence/run.sh   # crash table + throughput per fsync policy (~10 min)
 bin/shardis-crashtest -failover plain,wait,slowlink,slowlink+wait   # replication lost-write window
@@ -182,6 +185,7 @@ bin/shardis-crashtest -cluster-failover 2000,5000 -runs 20          # automatic 
 bash docs/benchmarks/iter-09-failover/run.sh      # the failover timing table (~7 min)
 bin/shardis-crashtest -partition 2000,5000 -runs 10   # split-brain window + lost writes (ADR 030)
 bash docs/benchmarks/iter-10-partition/run.sh     # the partition table (~5 min)
+bash docs/benchmarks/iter-11-resharding/run.sh    # rebalance 3→4 primaries under load, vs Redis (~6 min)
 bash docs/benchmarks/iter-06-replication/run.sh   # the full failover table (~4 min)
 bash docs/benchmarks/iter-07-cluster/run.sh       # single node vs cluster, Shardis and Redis (~3 min)
 SHARDIS_GOSSIP_BENCH=$PWD/docs/benchmarks/iter-08-gossip/raw.csv go test ./internal/cluster -run TestGossipScaling -v -timeout 20m
@@ -202,4 +206,11 @@ SHARDIS_ENABLE_FAULT_INJECTION=yes make cluster-up-local   # SHARDIS_* env reach
 redis-cli -p 7000 fault partition a   # send to EVERY node: cut a off (bus + replication), ADR 031
 redis-cli -p 7000 fault heal          # send to every node: remove all fault rules
 rm -rf .cluster-local    # forget saved nodes.conf (otherwise earlier failovers are remembered)
+bin/shardis-admin nodes -addr 127.0.0.1:7000      # slots per primary, open (half-moved) slots
+bin/shardis --port 7006 --dir /tmp/g --cluster-enabled yes &   # an empty node to add
+bin/shardis-admin add-node -addr 127.0.0.1:7000 -new 127.0.0.1:7006   # waits until everyone knows it
+bin/shardis-admin rebalance -addr 127.0.0.1:7000  # even out slots (live: clients get MOVED/ASK, no errors)
+bin/shardis-admin reshard -addr 127.0.0.1:7000 -from <id> -to <id> -slots 100
+bin/shardis-admin fix -addr 127.0.0.1:7000        # finish slots a crashed run left half-moved
+bin/shardis-admin remove-node -addr 127.0.0.1:7000 -id <id>   # must own no slots; then stop it
 ```

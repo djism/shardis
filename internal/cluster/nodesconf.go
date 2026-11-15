@@ -22,6 +22,8 @@ import (
 //	epoch <currentEpoch>
 //	vote <lastVoteEpoch>    (a primary votes at most once per epoch, even across restarts)
 //	node <id> <name|-> <client-addr> <internal-addr> <bus-port> <primary|replica> <primary-id|-> <config-epoch> <slots...>
+//	migrating <slot> <node-id>   (a slot we're moving away, ADR 032)
+//	importing <slot> <node-id>   (a slot we're taking over)
 //
 // It's rewritten atomically (temp file, fsync, rename, fsync dir), like the
 // AOF manifest, so a crash never leaves a half-written file.
@@ -75,6 +77,12 @@ func (c *Cluster) encodeState() []byte {
 		}
 		b.WriteByte('\n')
 	}
+	for s, n := range c.migrating {
+		fmt.Fprintf(&b, "migrating %d %s\n", s, n.id)
+	}
+	for s, n := range c.importing {
+		fmt.Fprintf(&b, "importing %d %s\n", s, n.id)
+	}
 	return []byte(b.String())
 }
 
@@ -97,6 +105,12 @@ func (c *Cluster) loadState() (bool, error) {
 		ranges []string
 	}
 	var claims []slotClaim
+	type marker struct {
+		importing bool
+		slot      uint16
+		id        string
+	}
+	var markers []marker
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for line := 1; sc.Scan(); line++ {
@@ -149,6 +163,15 @@ func (c *Cluster) loadState() (bool, error) {
 			}
 			c.nodes[n.id] = n
 			claims = append(claims, slotClaim{n, f[9:]})
+		case "migrating", "importing":
+			if len(f) != 3 {
+				return false, bad
+			}
+			s, err := strconv.Atoi(f[1])
+			if err != nil || s < 0 || s >= keyslot.Count {
+				return false, bad
+			}
+			markers = append(markers, marker{f[0] == "importing", uint16(s), f[2]})
 		default:
 			return false, bad
 		}
@@ -165,6 +188,17 @@ func (c *Cluster) loadState() (bool, error) {
 			for s := int(rg.Start); s <= int(rg.End); s++ {
 				c.owner[s] = cl.n
 			}
+		}
+	}
+	for _, m := range markers {
+		n := c.nodes[m.id]
+		switch {
+		case n == nil:
+			c.log.Warn("nodes.conf: migration marker for an unknown node; dropped", "slot", m.slot, "node", m.id)
+		case m.importing:
+			c.importing[m.slot] = n
+		default:
+			c.migrating[m.slot] = n
 		}
 	}
 	if c.myself = c.nodes[myID]; c.myself == nil {

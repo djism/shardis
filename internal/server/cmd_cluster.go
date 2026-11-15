@@ -2,6 +2,8 @@ package server
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -13,20 +15,26 @@ import (
 
 const errCrossSlot = "CROSSSLOT Keys in request don't hash to the same slot"
 
-// route decides whether this node may run a command with these keys. It
-// returns "" if so, otherwise the error to send: CROSSSLOT if the keys span
-// slots, or MOVED <slot> <host:port> pointing at the slot's owner. Clients
-// follow MOVED and (smart ones) update their slot map.
-//
-// A replica serves reads for its primary's slots only to connections that
-// sent READONLY; everything else is redirected to the primary.
-func (s *Server) route(cl *client, cmd command, keys [][]byte) string {
+// sameSlot returns the slot all keys hash to, or false if they don't agree.
+func sameSlot(keys [][]byte) (uint16, bool) {
 	slot := keyslot.Of(keys[0])
 	for _, k := range keys[1:] {
 		if keyslot.Of(k) != slot {
-			return errCrossSlot
+			return 0, false
 		}
 	}
+	return slot, true
+}
+
+// route decides whether this node may run a command with these keys. It
+// returns "" if so, otherwise the error to send: MOVED <slot> <host:port>
+// pointing at the slot's owner (clients follow it and, smart ones, update
+// their slot map), or during a migration ASK / TRYAGAIN (cmd_migrate.go).
+// The caller holds the slot's gate.
+//
+// A replica serves reads for its primary's slots only to connections that
+// sent READONLY; everything else is redirected to the primary.
+func (s *Server) route(cl *client, cmd command, slot uint16, keys [][]byte, asking bool) string {
 	t := s.cluster.View() // one lock-free snapshot for the whole decision (ADR 026)
 	owner, me := t.Owner(slot), t.Me
 	if owner == nil {
@@ -39,6 +47,17 @@ func (s *Server) route(cl *client, cmd command, keys [][]byte) string {
 		return "CLUSTERDOWN The cluster is down"
 	}
 	if owner == me {
+		if to := t.MigratingTo(slot); to != nil {
+			return s.routeMigrating(slot, keys, to)
+		}
+		return ""
+	}
+	if asking && t.ImportingFrom(slot) != nil {
+		// A client sent here by -ASK. A multi-key command is only safe if
+		// every key has already arrived.
+		if len(keys) > 1 && s.countExisting(keys) != len(keys) {
+			return errTryAgain
+		}
 		return ""
 	}
 	if cl.readonly && cmd.flags&flagWrite == 0 && me.Primary == owner {
@@ -136,6 +155,8 @@ func cmdCluster(cl *client, args [][]byte) {
 			return
 		}
 		replyOK(cl, c.SetConfigEpoch(e))
+	case sub == "SETSLOT" && len(args) >= 4:
+		clusterSetSlot(cl, args)
 	case sub == "KEYSLOT" && len(args) == 3:
 		cl.w.WriteInt(int64(keyslot.Of(args[2])))
 	case sub == "MYID" && len(args) == 2:
@@ -290,6 +311,17 @@ func clusterNodes(t *cluster.Topology) string {
 				fmt.Fprintf(&b, " %d", r.Start)
 			} else {
 				fmt.Fprintf(&b, " %d-%d", r.Start, r.End)
+			}
+		}
+		if n == t.Me {
+			// Open slots, in Redis's notation; redis-cli --cluster check
+			// reads these: [slot->-target] migrating, [slot-<-source] importing.
+			mig, imp := t.Migrations()
+			for _, s := range slices.Sorted(maps.Keys(mig)) {
+				fmt.Fprintf(&b, " [%d->-%s]", s, mig[s].ID)
+			}
+			for _, s := range slices.Sorted(maps.Keys(imp)) {
+				fmt.Fprintf(&b, " [%d-<-%s]", s, imp[s].ID)
 			}
 		}
 		b.WriteByte('\n')

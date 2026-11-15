@@ -890,3 +890,105 @@ acknowledged writes. For a cache, that tradeoff is usually fine."
 2. A 5-node-primary cluster is split 2 | 3. Which side keeps serving, and what happens to the
    slots of the two primaries on the small side?
 <details><summary>Answer</summary>The 3-primary side has a majority and keeps serving. The 2 primaries on the small side can each reach only 2 of 5, so after a node timeout they refuse with CLUSTERDOWN. On the big side, their slots fail over only if their replicas are on the big side. If a replica is stuck on the small side too, those slots stay down, and with full coverage on, the whole big side refuses keyed commands until the heal.</details>
+
+## Iteration 11: Live resharding, adding and removing nodes
+
+**What we built**
+Slots can now move between primaries while clients keep reading and writing, using Redis's
+classic protocol: MIGRATING/IMPORTING markers, `MIGRATE` in batches, `-ASK` redirects and a final
+`SETSLOT NODE`. `shardis-admin` adds and removes nodes and rebalances, and the real
+`redis-cli --cluster reshard/rebalance` works too. A minimal `pkg/client` follows MOVED and ASK,
+and the loadgen gained a cluster mode with a 100 ms timeline.
+
+**How it works**
+Moving slot 100 from `a` to the new node `g`, with clients running:
+```
+ 1. g: SETSLOT 100 IMPORTING a    g serves slot-100 keys, but only after ASKING
+ 2. a: SETSLOT 100 MIGRATING g    a: key still here? serve it. Gone? "-ASK 100 g"
+ 3. a: MIGRATE g ... KEYS k1..k100   (repeat until the slot is empty on a)
+        client ──GET k1──► a ──"-ASK 100 g"──► client ──ASKING; GET k1──► g ✓
+ 4. g: SETSLOT 100 NODE g         g owns it, bumps its epoch (no vote needed)
+ 5. a: SETSLOT 100 NODE g         a now says "-MOVED 100 g" (update your map)
+ 6. others: SETSLOT 100 NODE g    (gossip would tell them anyway, a bit later)
+```
+- **ASK vs MOVED:** ASK means "just this once, try over there". MOVED means "it lives there
+  now, update your map".
+- **Why the order matters:**
+  - If `a` sent ASK before `g` was importing, `g` would answer "MOVED back to `a`", and the
+    client would loop.
+  - If `a` flipped to `g` before `g` did, each node would point at the other.
+
+The hard part was making it **atomic** in a server that runs commands in parallel. Every keyed
+command holds a per-slot "gate" (a reader/writer lock) shared from routing to execution.
+MIGRATE holds it exclusively while a batch is in flight. So a key is always either still on `a`
+or already on `g`, never neither.
+
+**Why we did it this way**
+- **Classic MIGRATE + ASK (ADR 032)** rather than streaming whole slot ranges. It's in the
+  Redis Cluster spec and every client understands it. Redis 8.10's own `redis-cli` now uses
+  "atomic slot migration" (stream a whole range, pause writes briefly, flip it in one step),
+  which we measured as 6× faster. That's what I'd build at scale.
+- **The per-slot gate (ADR 033)** rather than holding store locks across the network.
+  - Switching it off makes `TestMigrateUnderConcurrentWrites` lose acknowledged INCRs in
+    10 of 10 runs.
+  - On normal traffic its cost was too small to measure.
+- **Our own DUMP format with version + CRC-64 (ADR 034),** because both ends are Shardis.
+- **The importing node bumps its epoch without a vote (ADR 035),** like Redis: one tool
+  coordinates the move, so there's nobody to outvote.
+
+**What can go wrong**
+- **It's slow and it costs throughput.** 18.9 s for 4096 slots and 250k keys. Throughput was
+  20% lower than the control during the move, and p99 went from 1.3 to 2.2 ms. Redis 8.10 did
+  the same move in 3.1 s.
+- **Multi-key commands can get `TRYAGAIN`** while their keys are split across two nodes.
+- **Replicas learn new owners only by gossip,** so for 1–3 s `redis-cli --cluster check` says
+  "nodes don't agree". Redis pushes UPDATE messages; we don't have them yet.
+- **A crash mid-move leaves "open" slots.** The markers survive in nodes.conf, and
+  `shardis-admin fix` finishes them.
+- **A failover mid-move loses the markers** on the promoted replica (Redis has the same gap).
+  That's for the Iteration 13 chaos tests.
+- **Found along the way:**
+  - Our `add-node` first returned before every node knew the newcomer, so the rebalance hit
+    "I don't know about node". It now waits for every node.
+  - Real Redis's new node answers CLUSTERDOWN for ~1.4 s if you rebalance right after
+    `redis-cli --cluster add-node`, because the node is still settling. Wait for its
+    `cluster_state:ok` first.
+- This Mac was swapping heavily (30 GB of swap in use), which freezes everything for up to 2.5 s.
+  That's why every benchmark has a no-rebalance control run next to it.
+
+**Try it yourself**
+```
+rm -rf .cluster-local && make cluster-up-local
+bin/shardis --port 7006 --dir /tmp/g --cluster-enabled yes &         # an empty node
+bin/shardis-admin add-node -addr 127.0.0.1:7001 -new 127.0.0.1:7006
+bin/shardis-loadgen -cluster -addr 127.0.0.1:7001 -keys 100000 -preload -warmup 0 -duration 30s &
+bin/shardis-admin rebalance -addr 127.0.0.1:7001                       # ~4096 slots to the new node
+bin/shardis-admin nodes -addr 127.0.0.1:7001                           # 4096 slots each
+# the loadgen's summary: "followed N MOVED and M ASK redirects", and no errors line
+redis-cli --cluster check 127.0.0.1:7001   # "don't agree" for a few s (replicas catch up by gossip), then [OK]
+make cluster-down-local; kill %1
+bash docs/benchmarks/iter-11-resharding/run.sh                         # the full comparison (~6 min)
+```
+
+**Interview question you can now answer**
+*"How do you move data between shards without downtime? What's the difference between MOVED
+and ASK?"*
+"In Redis Cluster the target marks the slot importing, the source marks it migrating, and keys
+move in batches with MIGRATE. During the move the source serves keys it still has, and for
+anything already moved it replies ASK, which means 'try the target, just this once'. The client
+sends ASKING there so the target accepts it. When the slot's empty, the target takes ownership
+with a higher config epoch, and from then on everyone replies MOVED, meaning 'update your map'.
+The order matters: target importing before source migrating, and target owning before source
+letting go, or clients bounce between them. In my version I also had to make 'is the key still
+here?' atomic, because my server runs commands in parallel. I added a per-slot reader/writer
+lock, and I proved it matters: without it, a test lost acknowledged writes every run. I moved a
+quarter of a 1M-key cluster under load with zero client errors. It cost about 20% throughput for
+19 seconds, while Redis 8's newer range-streaming migration took 3. That's the direction I'd go
+at scale."
+
+**Check yourself**
+1. A client sends `MGET {u1}:a {u1}:b` to the source while slot `{u1}` is migrating, `a` has moved and `b` hasn't. What does it get, and why not just ASK?
+<details><summary>Answer</summary>TRYAGAIN. The two keys are on different nodes right now, so neither node can answer the whole command atomically. ASK would send it to the target, which doesn't have b yet. TRYAGAIN tells the client to wait a moment and retry; once b has moved too, the source answers ASK and the target serves both.</details>
+
+2. Why does the target node, not the source, take ownership first (`SETSLOT NODE`)?
+<details><summary>Answer</summary>While the source is still MIGRATING, it answers ASK for moved keys, and the target (now the owner) serves them. Everything works. If the source flipped first, it would say MOVED-to-target while the target, still only IMPORTING, says MOVED-back-to-source for clients without ASKING: a redirect loop. Target first means there's always a node willing to serve every key.</details>

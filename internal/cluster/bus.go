@@ -544,6 +544,9 @@ func (c *Cluster) updateFromHeader(n *node, m *message) (changed bool, replicate
 			changed = true
 		}
 	}
+	if changed {
+		c.dropStaleMarkers()
+	}
 	if iLost || primaryLost {
 		replicateFrom = c.adoptNewOwner(n, iLost, primaryLost)
 	}

@@ -91,6 +91,9 @@ type Topology struct {
 	Me           *Node
 	CurrentEpoch uint64
 	owner        [keyslot.Count]*Node // slot → primary that serves it (nil = nobody)
+	// Slot migrations this node takes part in (ADR 032); nil when none, so
+	// the per-command check is a nil-map lookup.
+	migrating, importing map[uint16]*Node
 
 	// Computed once per snapshot, so per-command checks are O(1).
 	minority      bool // we can't reach a majority of the slot-serving primaries
@@ -296,6 +299,17 @@ func parseRange(s string) (Range, error) {
 		return Range{}, fmt.Errorf("bad slot range %q", s)
 	}
 	return Range{uint16(a), uint16(b)}, nil
+}
+
+// MigratingTo is the node we're moving slot s to (nil = not migrating).
+func (t *Topology) MigratingTo(s uint16) *Node { return t.migrating[s] }
+
+// ImportingFrom is the node we're taking slot s from (nil = not importing).
+func (t *Topology) ImportingFrom(s uint16) *Node { return t.importing[s] }
+
+// Migrations lists this node's open slots, for CLUSTER NODES.
+func (t *Topology) Migrations() (migrating, importing map[uint16]*Node) {
+	return t.migrating, t.importing
 }
 
 // Owner is the primary that serves slot s, or nil if no node does.

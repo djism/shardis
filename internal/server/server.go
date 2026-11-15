@@ -55,6 +55,9 @@ type Server struct {
 	commands  map[string]command
 	started   time.Time
 
+	gates        *slotGates // per-slot migration gates (ADR 033)
+	migrateConns migrateConns
+
 	ln net.Listener
 
 	mu      sync.Mutex
@@ -74,7 +77,7 @@ func New(opts Options) *Server {
 	}
 	s := &Server{
 		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, repl: opts.Repl, faults: opts.Faults, cluster: opts.Cluster, bus: opts.Bus, readsDown: opts.AllowReadsWhenDown, hz: opts.Hz,
-		conns: make(map[net.Conn]*client), started: time.Now(),
+		conns: make(map[net.Conn]*client), started: time.Now(), gates: new(slotGates),
 	}
 	s.commands = s.commandTable()
 	return s
@@ -129,6 +132,7 @@ func (s *Server) shutdown() {
 	}
 	s.closing = true
 	s.ln.Close()
+	s.migrateConns.closeAll()
 	// Closing a conn makes its goroutine's blocked Read return an error,
 	// which is how we get every handler to exit.
 	for c := range s.conns {
@@ -179,7 +183,10 @@ type client struct {
 	// readonly is set by READONLY: in cluster mode, this connection may read
 	// from a replica (for the replica's primary's slots).
 	readonly bool
-	id       int64
+	// asking is set by ASKING: the next command may be served for a slot
+	// we're importing (Iteration 11).
+	asking bool
+	id     int64
 
 	// replPort/replHost are what a replica announced with REPLCONF
 	// listening-port / ip-address.

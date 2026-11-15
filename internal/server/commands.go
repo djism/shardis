@@ -47,6 +47,9 @@ const (
 	// nothing can be evicted. DEL is a write but not denyoom: deleting is
 	// how you get out of an out-of-memory situation.
 	flagDenyOOM
+	// flagAsking: the command implies ASKING (RESTORE-ASKING, which MIGRATE
+	// sends to the target of a slot migration).
+	flagAsking
 )
 
 const wd = flagWrite | flagDenyOOM
@@ -70,6 +73,14 @@ func (s *Server) commandTable() map[string]command {
 		"cluster":   {arity: -2, run: cmdCluster},
 		"readonly":  {arity: 1, run: cmdReadOnly},
 		"readwrite": {arity: 1, run: cmdReadWrite},
+		"asking":    {arity: 1, run: cmdAsking},
+
+		// slot migration (cmd_migrate.go). MIGRATE declares no keys on
+		// purpose: it takes its slots' gates exclusively itself.
+		"migrate":        {arity: -6, flags: flagWrite, run: cmdMigrate},
+		"dump":           {arity: 2, firstKey: 1, lastKey: 1, step: 1, run: cmdDump},
+		"restore":        {arity: -4, flags: wd, firstKey: 1, lastKey: 1, step: 1, run: cmdRestore},
+		"restore-asking": {arity: -4, flags: wd | flagAsking, firstKey: 1, lastKey: 1, step: 1, run: cmdRestore},
 
 		// persistence (cmd_persist.go)
 		"bgrewriteaof": {arity: 1, run: cmdBgRewriteAOF},
@@ -129,8 +140,22 @@ func (s *Server) dispatch(cl *client, args [][]byte) {
 	// Cluster routing comes first: a command for a slot we don't serve gets
 	// redirected before anything else looks at it (ADR 022).
 	if s.cluster != nil {
+		asking := cl.asking || cmd.flags&flagAsking != 0
+		if name != "asking" {
+			cl.asking = false // ASKING covers exactly one command
+		}
 		if keys := cmd.keysOf(args); len(keys) > 0 {
-			if redirect := s.route(cl, cmd, keys); redirect != "" {
+			slot, ok := sameSlot(keys)
+			if !ok {
+				cl.w.WriteError(errCrossSlot)
+				return
+			}
+			// Held through routing *and* execution, so a migration can't
+			// move these keys in between (ADR 033).
+			gate := &s.gates[slot]
+			gate.RLock()
+			defer gate.RUnlock()
+			if redirect := s.route(cl, cmd, slot, keys, asking); redirect != "" {
 				cl.w.WriteError(redirect)
 				return
 			}

@@ -96,6 +96,8 @@ type Cluster struct {
 	myself        *node
 	nodes         map[string]*node
 	owner         [keyslot.Count]*node
+	migrating     map[uint16]*node // slot → node we're moving it to (ADR 032)
+	importing     map[uint16]*node // slot → node we're taking it from
 	currentEpoch  uint64
 	forgotten     map[string]time.Time // CLUSTER FORGET'd: ignore gossip about them until then
 	lastVoteEpoch uint64               // the epoch we last voted in: at most one vote per epoch, saved in nodes.conf
@@ -147,6 +149,7 @@ func New(opts Options) (*Cluster, error) {
 	}
 	c := &Cluster{
 		opts: opts, log: opts.Log, nodes: map[string]*node{}, forgotten: map[string]time.Time{},
+		migrating: map[uint16]*node{}, importing: map[uint16]*node{},
 		rng: mrand.New(mrand.NewPCG(mrand.Uint64(), mrand.Uint64())), inbound: map[net.Conn]struct{}{},
 		quit: make(chan struct{}),
 	}
@@ -234,6 +237,15 @@ func (c *Cluster) publish() {
 		}
 	}
 	t.Me = snap[c.myself]
+	if len(c.migrating) > 0 || len(c.importing) > 0 {
+		t.migrating, t.importing = map[uint16]*Node{}, map[uint16]*Node{}
+		for s, n := range c.migrating {
+			t.migrating[s] = snap[n]
+		}
+		for s, n := range c.importing {
+			t.importing[s] = snap[n]
+		}
+	}
 	t.computeState(!c.opts.AllowPartialCoverage)
 	c.applyRejoinDelay(t, time.Now())
 	c.view.Store(t)
@@ -360,6 +372,16 @@ func (c *Cluster) removeNode(n *node) {
 	for s, o := range c.owner {
 		if o == n {
 			c.owner[s] = nil
+		}
+	}
+	for s, o := range c.migrating {
+		if o == n {
+			delete(c.migrating, s)
+		}
+	}
+	for s, o := range c.importing {
+		if o == n {
+			delete(c.importing, s)
 		}
 	}
 	if n.link != nil {
