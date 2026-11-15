@@ -786,3 +786,107 @@ Raft."
 
 2. Why does the cluster refuse to promote a replica whose link to the primary has been down for an hour?
 <details><summary>Answer</summary>Its data is an hour old. Promoting it would silently discard an hour of acknowledged writes and serve old data as if it were current. Keeping the shard down until the primary or a fresh replica returns is the lesser evil. That's Redis's cluster-replica-validity-factor (data older than 10 × node_timeout).</details>
+
+## Iteration 10: Network partitions and split brain
+
+**What we built**
+A node that can't reach a majority of the primaries now stops serving (`CLUSTERDOWN`). When it
+regains the majority, it waits a short rejoin delay before serving again. We added
+`FAULT PARTITION`/`FAULT HEAL` to cut the network between groups of nodes on demand,
+`--cluster-allow-reads-when-down`, and a crash-tool mode that measures the split-brain window
+on 6 real processes.
+
+**How it works**
+```
+      minority side           │           majority side
+  clients ──► a (primary)     │     b   c   (primaries)
+              "OK" "OK" ...   │     d (a's replica)   e   f
+                              │
+ t=0      the cut ────────────┼──────────────────────────────────
+ t≈2.1s   a: "I can only      │
+          reach 1 of 3        │
+          primaries" →        │
+          CLUSTERDOWN         │
+ t≈3.2s                       │   b,c agree a is FAIL → d elected,
+                              │   d takes a's slots (epoch +1)
+ heal     a hears d's higher epoch → becomes d's replica,
+          drops its own data → every write a acked after t=0 is gone
+```
+Each node already tracks who it can reach (PFAIL from Iteration 9). The new rule is one line of
+logic: if the primaries I can reach (counting me) aren't a majority of the slot-serving
+primaries, I'm in the minority and I refuse keyed commands. `FAULT PARTITION a` is sent to every
+node. Each one works out which side it's on and adds "drop bus messages to them" and "sever
+replication to them" rules for every node on the other side. Clients are unaffected.
+
+**Why we did it this way**
+- **Minority stops serving, plus a rejoin delay (ADR 030).** The alternative is a **lease**: the
+  primary may serve only while a majority has granted it a time-limited permission, and nobody
+  replaces it until that runs out. Leases give a hard "never two primaries" guarantee but need a
+  lease protocol and bounded clock drift. Redis uses the simpler timing rule, and so do we.
+- **Partitions built from our existing fault points (ADR 031)** rather than iptables or
+  Toxiproxy. They're deterministic, need no root, and the same command works in `go test`,
+  locally and in Docker. Real network-level chaos comes in Iteration 14.
+
+**What can go wrong**
+- **Every write the cut-off primary acknowledged during the split is lost.** At a 2 s node
+  timeout, `a` kept saying OK for **2.07 s** (p50). After healing, **2,125,387 of 2,125,779** of
+  those writes (99.98%) were gone. The few survivors were already on their way to `d`. Loss ≈
+  write rate × node timeout. With Redis's default 15 s, that's ~15 s of acknowledged writes.
+- **"No two primaries at once" is a race, not a guarantee.** In all 20 runs `a` stopped before
+  `d` started, by 0.2–1.4 s. But one 5 s run had only 199 ms to spare. A long GC pause on `a`
+  could make the windows overlap.
+- **There's a gap when nobody is writable** for those slots (0.8–1.4 s at 2 s, beyond the
+  detection time itself). With full coverage on, the whole majority side refuses keyed commands
+  while `a` is FAIL.
+- **A partition is worse than a crash.** A crash loses ≤ 146 in-flight writes (Iteration 9). A
+  partition loses ~215,000 in the same setup, because the cut-off node is alive and keeps
+  acknowledging writes it can't protect.
+- **About CAP:** in a partition you must pick consistency (refuse) or availability (answer).
+  Redis Cluster is **neither strictly CP nor AP**.
+  - It's not AP: the minority refuses after a timeout, and in Scenario B (a primary cut off
+    together with its replica) the whole cluster went down.
+  - It's not CP: for the first node timeout, the minority answers "OK" to writes it will later
+    throw away.
+
+  It's a pragmatic middle: available for a while, then consistent-ish.
+- Bug found: the reads-when-down test first passed for the wrong reason, because its probe
+  write used the same key it later read. Fixed with a separate probe key in the same slot.
+
+**Try it yourself**
+```
+# fault injection on, 5 s node timeout (SHARDIS_* env vars reach every node);
+# rm -rf .cluster-local first so no earlier failover is remembered in nodes.conf
+rm -rf .cluster-local
+SHARDIS_ENABLE_FAULT_INJECTION=yes SHARDIS_CLUSTER_NODE_TIMEOUT=5000 make cluster-up-local
+for p in 7000 7001 7002 7003 7004 7005; do redis-cli -p $p fault partition a; done
+redis-cli -p 7000 set hello world          # slot 866 is a's. "OK": a doesn't know yet (keep trying)
+redis-cli -p 7000 set hello world          # after ~5-7 s: (error) CLUSTERDOWN The cluster is down
+redis-cli -p 7003 role                     # ~7-9 s after the cut: d is "master"
+for p in 7000 7001 7002 7003 7004 7005; do redis-cli -p $p fault heal; done
+redis-cli -p 7000 role                     # a is now a "slave" of d
+redis-cli -c -p 7001 get hello             # (nil): a's split-brain write is gone
+make cluster-down-local
+./bin/shardis-crashtest -partition 2000 -runs 3     # measure the window
+bash docs/benchmarks/iter-10-partition/run.sh       # the full table (~5 min)
+```
+
+**Interview question you can now answer**
+*"Can Redis Cluster lose acknowledged writes during a network partition? How much?"*
+"Yes, and I measured it. If a primary gets cut off with some of its clients, it keeps
+acknowledging writes until it notices it can't reach a majority of the primaries, which takes
+about the node timeout. Meanwhile the majority side elects its replica. When the partition
+heals, the old primary sees the higher epoch, becomes a replica and throws away everything it
+accepted. With a 2 second timeout that was about 2 seconds of writes, around 215,000 in my
+setup, or 99.98% of what it acknowledged during the split. A crash loses far less, only what was
+in flight, because a dead node can't keep saying OK. The fix depends on the use case: shorter
+timeouts, `WAIT` for important writes, or leases or consensus if you truly can't lose
+acknowledged writes. For a cache, that tradeoff is usually fine."
+
+**Check yourself**
+1. Why does a node wait before serving again after the partition heals, instead of resuming
+   right away?
+<details><summary>Answer</summary>Right after healing, it can reach the majority again but may not have heard yet that its replica was promoted in a higher epoch. If it resumed instantly, it could accept writes for slots it no longer owns, and they'd be lost a moment later. The rejoin delay (node timeout, clamped to 0.5–5 s) gives gossip time to deliver the news first.</details>
+
+2. A 5-node-primary cluster is split 2 | 3. Which side keeps serving, and what happens to the
+   slots of the two primaries on the small side?
+<details><summary>Answer</summary>The 3-primary side has a majority and keeps serving. The 2 primaries on the small side can each reach only 2 of 5, so after a node timeout they refuse with CLUSTERDOWN. On the big side, their slots fail over only if their replicas are on the big side. If a replica is stuck on the small side too, those slots stay down, and with full coverage on, the whole big side refuses keyed commands until the heal.</details>

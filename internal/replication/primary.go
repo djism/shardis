@@ -39,12 +39,21 @@ func (l *link) close() {
 // ServePSYNC takes over a client connection that sent PSYNC and turns it into
 // a replication link. It runs until the link ends. replid/offset are what the
 // replica asked for ("?" / -1 for a fresh replica).
-func (n *Node) ServePSYNC(conn net.Conn, r *resp.Reader, replid string, offset int64, replicaPort int) {
-	host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+func (n *Node) ServePSYNC(conn net.Conn, r *resp.Reader, replid string, offset int64, replicaPort int, replicaHost string) {
+	host := replicaHost
+	if host == "" {
+		host, _, _ = net.SplitHostPort(conn.RemoteAddr().String())
+	}
 	l := &link{id: hostPort(host, replicaPort), conn: conn, stopCh: make(chan struct{})}
 	l.lastAck.Store(time.Now().UnixNano())
 	w := bufio.NewWriterSize(conn, 64<<10)
 
+	// Fault injection first: during a simulated partition, not even the
+	// PSYNC reply (let alone a snapshot) may cross to this replica.
+	if n.opts.Faults.Check(faults.ReplStream, l.id, l.stopCh) {
+		conn.Close()
+		return
+	}
 	n.mu.Lock()
 	if n.closed || n.Role() != RolePrimary {
 		n.mu.Unlock()

@@ -55,6 +55,7 @@ type Options struct {
 	PingPeriod   time.Duration // primary → replica heartbeat in the stream
 	Timeout      time.Duration // link considered dead after this much silence
 	AnnouncePort int           // our client port, sent as REPLCONF listening-port
+	AnnounceHost string        // our host as other nodes know it, sent as REPLCONF ip-address ("" = let the primary use our IP)
 	Faults       *faults.Registry
 	Bus          *events.Bus
 	Log          *slog.Logger
@@ -63,9 +64,10 @@ type Options struct {
 // Node is this server's replication state: a primary with links to its
 // replicas, or a replica with a link to its primary.
 type Node struct {
-	opts Options
-	log  *slog.Logger
-	role atomic.Int32
+	opts         Options
+	log          *slog.Logger
+	role         atomic.Int32
+	announceHost atomic.Value // string
 
 	mu      sync.Mutex
 	ackCond *sync.Cond // broadcast when a replica's ack offset changes (WAIT)
@@ -118,6 +120,7 @@ func NewNode(opts Options) *Node {
 	}
 	n.ackCond = sync.NewCond(&n.mu)
 	n.linkStatus.Store("")
+	n.announceHost.Store(opts.AnnounceHost)
 	opts.Engine.SetLog(store.Tee(opts.AOF, n))
 	n.done.Add(1)
 	go n.heartbeat()
@@ -286,3 +289,9 @@ func (n *Node) LinkDownFor() time.Duration {
 	}
 	return time.Since(time.Unix(0, last))
 }
+
+// SetAnnounceHost sets the host this node announces to its primary (REPLCONF
+// ip-address). In cluster mode it's the host of our internal address, so a
+// primary names our link exactly as the cluster names us; fault injection
+// (FAULT PARTITION) relies on that to cut the right links.
+func (n *Node) SetAnnounceHost(h string) { n.announceHost.Store(h) }

@@ -230,6 +230,9 @@ func (c *Cluster) cron() {
 		if c.considerFailover(now) {
 			changed = true
 		}
+		if c.wasMinority && !c.rejoinAt.IsZero() && !now.Before(c.rejoinAt) {
+			changed = true // the rejoin delay is over: republish so we serve again
+		}
 		if changed {
 			c.dirty = true
 			c.publish()

@@ -167,6 +167,7 @@ make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* en
                   #   or redis-cli --cluster create; state saved in <dir>/nodes.conf, ADR 024-026)
                   # --cluster-node-timeout 15000 (failure detection, ADR 027-029)
                   # --cluster-require-full-coverage yes|no
+                  # --cluster-allow-reads-when-down yes|no (serve stale reads in a minority, ADR 030)
 SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
 bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
 bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
@@ -179,6 +180,8 @@ bash docs/benchmarks/iter-05-persistence/run.sh   # crash table + throughput per
 bin/shardis-crashtest -failover plain,wait,slowlink,slowlink+wait   # replication lost-write window
 bin/shardis-crashtest -cluster-failover 2000,5000 -runs 20          # automatic failover time
 bash docs/benchmarks/iter-09-failover/run.sh      # the failover timing table (~7 min)
+bin/shardis-crashtest -partition 2000,5000 -runs 10   # split-brain window + lost writes (ADR 030)
+bash docs/benchmarks/iter-10-partition/run.sh     # the partition table (~5 min)
 bash docs/benchmarks/iter-06-replication/run.sh   # the full failover table (~4 min)
 bash docs/benchmarks/iter-07-cluster/run.sh       # single node vs cluster, Shardis and Redis (~3 min)
 SHARDIS_GOSSIP_BENCH=$PWD/docs/benchmarks/iter-08-gossip/raw.csv go test ./internal/cluster -run TestGossipScaling -v -timeout 20m
@@ -195,4 +198,8 @@ make cluster-down-local
 make cluster-up          # 6 containers with docker compose (deploy/compose), same ports
 make cluster-down
 redis-cli -c -p 7000     # -c follows MOVED; use timeouts in scripts (AirPlay owns *:7000)
+SHARDIS_ENABLE_FAULT_INJECTION=yes make cluster-up-local   # SHARDIS_* env reaches every node
+redis-cli -p 7000 fault partition a   # send to EVERY node: cut a off (bus + replication), ADR 031
+redis-cli -p 7000 fault heal          # send to every node: remove all fault rules
+rm -rf .cluster-local    # forget saved nodes.conf (otherwise earlier failovers are remembered)
 ```

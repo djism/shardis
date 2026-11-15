@@ -65,7 +65,7 @@ const (
 )
 
 func (n *Node) IsPrimary() bool      { return n.Primary == nil && n.Flags&FlagReplica == 0 }
-func (n *Node) Has(flag uint16) bool { return n.Flags&flag != 0 }
+func (n *Node) Has(flag uint16) bool { return n.Flags&flag != 0 } // any of the given bits
 
 // Label is the name if there is one, else a short ID (for logs and events).
 func (n *Node) Label() string {
@@ -93,6 +93,8 @@ type Topology struct {
 	owner        [keyslot.Count]*Node // slot → primary that serves it (nil = nobody)
 
 	// Computed once per snapshot, so per-command checks are O(1).
+	minority      bool // we can't reach a majority of the slot-serving primaries
+	rejoining     bool // we just got a majority back and are waiting before serving
 	stateOK       bool
 	fullCoverage  bool
 	pfailSlots    int
@@ -103,6 +105,26 @@ type Topology struct {
 func (t *Topology) computeState(fullCoverage bool) {
 	t.fullCoverage = fullCoverage
 	t.stateOK = true
+	// Minority check (ADR 030): of the primaries that serve slots, how many
+	// can we reach (not PFAIL/FAIL from our point of view, us included)?
+	// Without a majority we're on the losing side of a partition: stop
+	// serving, because the majority side may be electing our replacement.
+	serving := map[*Node]bool{}
+	for _, o := range t.owner {
+		if o != nil {
+			serving[o] = true
+		}
+	}
+	reachable := 0
+	for o := range serving {
+		if o == t.Me || !o.Has(FlagPFail|FlagFail) {
+			reachable++
+		}
+	}
+	t.minority = len(serving) > 0 && reachable < len(serving)/2+1
+	if t.minority {
+		t.stateOK = false
+	}
 	for _, o := range t.owner {
 		switch {
 		case o == nil:
@@ -118,6 +140,12 @@ func (t *Topology) computeState(fullCoverage bool) {
 	}
 }
 
+// Minority reports whether this node can't reach a majority of the
+// slot-serving primaries; Rejoining whether it just regained one and is
+// waiting before serving again.
+func (t *Topology) Minority() bool  { return t.minority }
+func (t *Topology) Rejoining() bool { return t.rejoining }
+
 // SlotHealth reports slots whose owner is suspected (PFAIL) or failed (FAIL).
 func (t *Topology) SlotHealth() (pfail, fail int) { return t.pfailSlots, t.failSlots }
 
@@ -125,6 +153,9 @@ func (t *Topology) SlotHealth() (pfail, fail int) { return t.pfailSlots, t.failS
 // required (the default), any unserved or failed slot makes the whole
 // cluster refuse keyed commands; otherwise only that slot does.
 func (t *Topology) Serves(s uint16) bool {
+	if t.minority || t.rejoining {
+		return false // on the minority side, nothing is served
+	}
 	if t.fullCoverage {
 		return t.stateOK
 	}

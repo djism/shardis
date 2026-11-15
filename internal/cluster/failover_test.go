@@ -266,3 +266,38 @@ func TestVoteOncePerEpochAndPersist(t *testing.T) {
 		t.Fatalf("after restart lastVoteEpoch = %d, want 10", again.lastVoteEpoch)
 	}
 }
+
+// A node cut off from the majority marks itself as minority (stops serving);
+// once it can reach the majority again it waits a rejoin delay before
+// serving, giving gossip time to deliver any slot changes first.
+func TestMinorityThenRejoinDelay(t *testing.T) {
+	s := startSeeded(t, false)
+	for name := range s.nodes { // isolate replica e from everyone (both directions)
+		if name == "e" {
+			for other := range s.nodes {
+				if other != "e" {
+					s.faults["e"].Set(faults.Rule{Point: faults.BusMessage, Kind: faults.Drop, Target: other})
+				}
+			}
+		} else {
+			s.faults[name].Set(faults.Rule{Point: faults.BusMessage, Kind: faults.Drop, Target: "e"})
+		}
+	}
+	e := s.nodes["e"]
+	waitFor(t, "e sees itself in a minority", 10*time.Second, func() bool { return e.View().Minority() })
+	if e.View().Serves(0) {
+		t.Fatal("a minority node still serves")
+	}
+	if !s.nodes["b"].View().StateOK() {
+		t.Fatal("the majority went down because one replica was cut off")
+	}
+	for _, r := range s.faults {
+		r.Clear("")
+	}
+	waitFor(t, "e out of the minority", 10*time.Second, func() bool { return !e.View().Minority() })
+	if v := e.View(); !v.Rejoining() || v.Serves(0) {
+		t.Fatalf("right after rejoining: rejoining=%v serves=%v (want a delay before serving)", v.Rejoining(), v.Serves(0))
+	}
+	took := waitFor(t, "e serves again", 10*time.Second, func() bool { return e.View().Serves(0) })
+	t.Logf("served again %v after regaining the majority (rejoin delay %v)", took.Round(time.Millisecond), e.rejoinDelay())
+}

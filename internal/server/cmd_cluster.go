@@ -32,9 +32,10 @@ func (s *Server) route(cl *client, cmd command, keys [][]byte) string {
 	if owner == nil {
 		return "CLUSTERDOWN Hash slot not served"
 	}
-	if !t.Serves(slot) {
-		// A failed primary and no replica has taken over yet (or, with full
-		// coverage required, any slot anywhere is down).
+	if !t.Serves(slot) && !(s.readsDown && cmd.flags&flagWrite == 0) {
+		// A failed primary with no replica taken over yet; with full coverage
+		// required, any slot down anywhere; or this node is on the minority
+		// side of a partition (ADR 030).
 		return "CLUSTERDOWN The cluster is down"
 	}
 	if owner == me {

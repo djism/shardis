@@ -17,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/djism/shardis/internal/cluster"
+	"github.com/djism/shardis/internal/faults"
 	"github.com/djism/shardis/internal/keyslot"
 	"github.com/djism/shardis/internal/replication"
 	"github.com/djism/shardis/internal/store"
@@ -35,7 +36,10 @@ type clusterNode struct {
 	stop       func() // like the process dying
 }
 
-func startCluster(t *testing.T) *testCluster {
+func startCluster(t *testing.T) *testCluster { return startClusterWith(t, false) }
+
+// startClusterWith: readsWhenDown sets AllowReadsWhenDown on every node.
+func startClusterWith(t *testing.T, readsWhenDown bool) *testCluster {
 	t.Helper()
 	names := []string{"a", "b", "c", "d", "e", "f"}
 	ports, used := map[string]int{}, map[int]bool{}
@@ -66,15 +70,17 @@ func startCluster(t *testing.T) *testCluster {
 			tc.topo = topo
 		}
 		engine, _ := store.New(store.EngineSharded, store.Options{})
+		reg := faults.New()
 		node := replication.NewNode(replication.Options{Engine: engine, PingPeriod: 100 * time.Millisecond,
-			Timeout: 2 * time.Second, AnnouncePort: ports[n], Log: quiet})
+			Timeout: 2 * time.Second, AnnouncePort: ports[n], AnnounceHost: "127.0.0.1", Faults: reg, Log: quiet})
 		addr := fmt.Sprintf("127.0.0.1:%d", ports[n])
 		cl, err := cluster.New(cluster.Options{ClientAddr: addr, InternalAddr: addr, Seed: topo,
-			NodeTimeout: 2 * time.Second, Replicator: node, Log: quiet})
+			NodeTimeout: 2 * time.Second, Replicator: node, Faults: reg, Log: quiet})
 		if err != nil {
 			t.Fatal(err)
 		}
-		s := New(Options{Engine: engine, Repl: node, Cluster: cl, Port: ports[n], Hz: 10, Log: quiet})
+		s := New(Options{Engine: engine, Repl: node, Cluster: cl, Port: ports[n], Hz: 10, Log: quiet,
+			Faults: reg, AllowReadsWhenDown: readsWhenDown})
 		if err := s.Listen(fmt.Sprintf("127.0.0.1:%d", ports[n])); err != nil {
 			t.Fatal(err)
 		}

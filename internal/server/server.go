@@ -34,22 +34,26 @@ type Options struct {
 	Faults  *faults.Registry  // nil = FAULT command disabled (the default)
 	Cluster *cluster.Cluster  // nil = not in cluster mode; the caller starts and closes it
 	Bus     *events.Bus       // nil = no events
-	Port    int               // our client port, for INFO
-	Hz      int               // for INFO and CONFIG GET hz
+	// AllowReadsWhenDown: while the cluster is down (or this node is in a
+	// minority), still serve reads (possibly stale). Writes are refused.
+	AllowReadsWhenDown bool
+	Port               int // our client port, for INFO
+	Hz                 int // for INFO and CONFIG GET hz
 }
 
 type Server struct {
-	log      *slog.Logger
-	engine   store.Engine
-	evictor  *store.Evictor
-	aof      *persist.AOF
-	repl     *replication.Node
-	faults   *faults.Registry
-	cluster  *cluster.Cluster
-	bus      *events.Bus
-	hz       int
-	commands map[string]command
-	started  time.Time
+	log       *slog.Logger
+	engine    store.Engine
+	evictor   *store.Evictor
+	aof       *persist.AOF
+	repl      *replication.Node
+	faults    *faults.Registry
+	cluster   *cluster.Cluster
+	bus       *events.Bus
+	readsDown bool
+	hz        int
+	commands  map[string]command
+	started   time.Time
 
 	ln net.Listener
 
@@ -69,7 +73,7 @@ func New(opts Options) *Server {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{
-		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, repl: opts.Repl, faults: opts.Faults, cluster: opts.Cluster, bus: opts.Bus, hz: opts.Hz,
+		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, repl: opts.Repl, faults: opts.Faults, cluster: opts.Cluster, bus: opts.Bus, readsDown: opts.AllowReadsWhenDown, hz: opts.Hz,
 		conns: make(map[net.Conn]*client), started: time.Now(),
 	}
 	s.commands = s.commandTable()
@@ -177,8 +181,10 @@ type client struct {
 	readonly bool
 	id       int64
 
-	// replPort is the port a replica announced with REPLCONF listening-port.
+	// replPort/replHost are what a replica announced with REPLCONF
+	// listening-port / ip-address.
 	replPort int
+	replHost string
 	// takeover, set by PSYNC, turns the connection into a replication link
 	// after the current command.
 	takeover func(net.Conn, *resp.Reader)

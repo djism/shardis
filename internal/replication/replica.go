@@ -114,6 +114,11 @@ func (n *Node) syncOnce(stop chan struct{}) error {
 	if _, err := c.call("REPLCONF", "listening-port", strconv.Itoa(n.opts.AnnouncePort)); err != nil {
 		return err
 	}
+	if h := n.announceHost.Load().(string); h != "" {
+		if _, err := c.call("REPLCONF", "ip-address", h); err != nil {
+			return err
+		}
+	}
 	if _, err := c.call("REPLCONF", "capa", "psync2"); err != nil {
 		return err
 	}

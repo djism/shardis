@@ -99,6 +99,8 @@ type Cluster struct {
 	currentEpoch  uint64
 	forgotten     map[string]time.Time // CLUSTER FORGET'd: ignore gossip about them until then
 	lastVoteEpoch uint64               // the epoch we last voted in: at most one vote per epoch, saved in nodes.conf
+	wasMinority   bool                 // we were cut off from the majority (rejoin delay pending)
+	rejoinAt      time.Time            // when we may serve again after regaining a majority
 	election      election             // our own run for primary, when our primary has failed
 	dirty         bool                 // nodes.conf needs saving
 	rng           *mrand.Rand
@@ -233,6 +235,7 @@ func (c *Cluster) publish() {
 	}
 	t.Me = snap[c.myself]
 	t.computeState(!c.opts.AllowPartialCoverage)
+	c.applyRejoinDelay(t, time.Now())
 	c.view.Store(t)
 }
 
@@ -447,4 +450,37 @@ func (c *Cluster) buildMessage(typ uint8, to *node) *message {
 	}
 	m.gossip = c.sampleGossip(to)
 	return m
+}
+
+// rejoinDelay is how long a node that was in a minority waits after
+// regaining a majority before serving again (Redis: node timeout, clamped to
+// 0.5-5 s). It gives gossip time to tell it "your slots belong to someone
+// else now" before it accepts a write it would later throw away.
+func (c *Cluster) rejoinDelay() time.Duration {
+	return min(max(c.opts.NodeTimeout, 500*time.Millisecond), 5*time.Second)
+}
+
+// applyRejoinDelay holds a node that just left the minority in a
+// "rejoining" state for rejoinDelay. Called with c.mu held, from publish.
+func (c *Cluster) applyRejoinDelay(t *Topology, now time.Time) {
+	switch {
+	case t.minority:
+		if !c.wasMinority {
+			c.log.Warn("minority partition: can't reach a majority of primaries; refusing commands")
+			c.emit("minority", map[string]any{"node": c.myself.label()})
+		}
+		c.wasMinority, c.rejoinAt = true, time.Time{}
+	case c.wasMinority:
+		if c.rejoinAt.IsZero() {
+			c.rejoinAt = now.Add(c.rejoinDelay())
+			c.log.Info("majority reachable again; waiting before serving", "delay", c.rejoinDelay())
+		}
+		if now.Before(c.rejoinAt) {
+			t.rejoining, t.stateOK = true, false
+			return
+		}
+		c.wasMinority, c.rejoinAt = false, time.Time{}
+		c.log.Info("rejoined the majority; serving again")
+		c.emit("rejoined", map[string]any{"node": c.myself.label()})
+	}
 }

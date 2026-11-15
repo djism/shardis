@@ -116,7 +116,8 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	}
 
 	srv := server.New(server.Options{Log: slog.Default(), Engine: engine, Evictor: evictor, AOF: aof,
-		Repl: repl, Faults: reg, Cluster: cl, Bus: bus, Port: cfg.Port, Hz: cfg.Hz})
+		Repl: repl, Faults: reg, Cluster: cl, Bus: bus, Port: cfg.Port, Hz: cfg.Hz,
+		AllowReadsWhenDown: cfg.ClusterReadsWhenDown})
 	if err := srv.Listen(addr); err != nil {
 		return err
 	}
@@ -181,6 +182,11 @@ func openCluster(cfg config.Config, repl *replication.Node, reg *faults.Registry
 	}
 	if internalAddr == "" {
 		internalAddr = clientAddr
+	}
+	// Announce our internal host to our primary, so its replication link to
+	// us is named the way the cluster names us (FAULT PARTITION needs that).
+	if h, _, err := net.SplitHostPort(internalAddr); err == nil {
+		repl.SetAnnounceHost(h)
 	}
 	cl, err := cluster.New(cluster.Options{
 		ClientAddr: clientAddr, InternalAddr: internalAddr, Seed: seed,

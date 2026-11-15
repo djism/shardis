@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/djism/shardis/internal/cluster"
 	"github.com/djism/shardis/internal/faults"
 	"github.com/djism/shardis/internal/replication"
 	"github.com/djism/shardis/internal/resp"
@@ -45,13 +46,18 @@ func cmdReplicaOf(cl *client, args [][]byte) {
 // REPLCONF is the replica's side of the handshake: listening-port <port>,
 // capa <capability>. (ACKs arrive on the replication link, not here.)
 func cmdReplConf(cl *client, args [][]byte) {
-	if len(args) >= 3 && strings.EqualFold(string(args[1]), "listening-port") {
-		p, err := strconv.Atoi(string(args[2]))
-		if err != nil {
-			cl.w.WriteError(errNotInt)
-			return
+	if len(args) >= 3 {
+		switch strings.ToLower(string(args[1])) {
+		case "listening-port":
+			p, err := strconv.Atoi(string(args[2]))
+			if err != nil {
+				cl.w.WriteError(errNotInt)
+				return
+			}
+			cl.replPort = p
+		case "ip-address":
+			cl.replHost = string(args[2])
 		}
-		cl.replPort = p
 	}
 	cl.w.WriteSimple("OK")
 }
@@ -66,8 +72,8 @@ func cmdPSync(cl *client, args [][]byte) {
 		cl.w.WriteError(errNotInt)
 		return
 	}
-	replid, port, node := string(args[1]), cl.replPort, cl.srv.repl
-	cl.takeover = func(c net.Conn, r *resp.Reader) { node.ServePSYNC(c, r, replid, off, port) }
+	replid, port, host, node := string(args[1]), cl.replPort, cl.replHost, cl.srv.repl
+	cl.takeover = func(c net.Conn, r *resp.Reader) { node.ServePSYNC(c, r, replid, off, port, host) }
 }
 
 // WAIT numreplicas timeout-ms: block until that many replicas have this
@@ -200,6 +206,12 @@ func cmdFault(cl *client, args [][]byte) {
 		}
 		reg.Clear(p)
 		cl.w.WriteSimple("OK")
+	case "PARTITION":
+		partition(cl, words[1:])
+	case "HEAL":
+		reg.Clear("")
+		cl.srv.log.Warn("fault injection: partition healed (all rules cleared)")
+		cl.w.WriteSimple("OK")
 	case "LIST":
 		rules := reg.List()
 		cl.w.WriteArrayHeader(len(rules))
@@ -207,6 +219,53 @@ func cmdFault(cl *client, args [][]byte) {
 			cl.w.WriteBulkString(r.String())
 		}
 	default:
-		cl.w.WriteError("ERR usage: FAULT SET|CLEAR|LIST")
+		cl.w.WriteError("ERR usage: FAULT SET|CLEAR|LIST|PARTITION|HEAL")
 	}
+}
+
+// partition implements FAULT PARTITION <node>...: the listed nodes (names or
+// IDs) form one side, everyone else the other. Send the same command to
+// every node: each one cuts what it sends across the split, which is cluster
+// bus messages (dropped) and the replication stream (severed), so together
+// they cut both directions (ADR 031). Client connections are left alone: a
+// client on either side can still reach the nodes on its side... and the
+// nodes on the other side, which is the split-brain risk we measure.
+func partition(cl *client, names []string) {
+	if cl.srv.cluster == nil {
+		cl.w.WriteError("ERR FAULT PARTITION needs cluster mode")
+		return
+	}
+	if len(names) == 0 {
+		cl.w.WriteError("ERR usage: FAULT PARTITION <node> [node ...]")
+		return
+	}
+	t := cl.srv.cluster.View()
+	side := map[*cluster.Node]bool{}
+	for _, name := range names {
+		var found *cluster.Node
+		for _, n := range t.Nodes {
+			if n.Name == name || n.ID == name || (len(name) >= 8 && strings.HasPrefix(n.ID, name)) {
+				found = n
+			}
+		}
+		if found == nil {
+			cl.w.WriteError("ERR unknown node " + name)
+			return
+		}
+		side[found] = true
+	}
+	reg, rules := cl.srv.faults, 0
+	for _, n := range t.Nodes {
+		if n == t.Me || side[n] == side[t.Me] {
+			continue // same side as us: keep talking
+		}
+		reg.Set(faults.Rule{Point: faults.BusMessage, Kind: faults.Drop, Target: n.ID})
+		reg.Set(faults.Rule{Point: faults.ReplStream, Kind: faults.Sever, Target: n.Internal})
+		rules += 2
+	}
+	cl.srv.log.Warn("fault injection: partition", "side", names, "rules", rules)
+	if cl.srv.bus.Active() {
+		cl.srv.bus.Emit("partition", map[string]any{"node": t.Me.Label(), "side": names, "cut_links": rules / 2})
+	}
+	cl.w.WriteSimple("OK")
 }

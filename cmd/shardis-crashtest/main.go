@@ -31,6 +31,12 @@
 // slots (see cluster_failover.go).
 //
 //	shardis-crashtest -cluster-failover 2000,5000 -runs 20
+//
+// With -partition it cuts a primary off from the rest of the cluster while
+// its clients keep writing to it, and measures the split-brain window (see
+// partition.go).
+//
+//	shardis-crashtest -partition 2000,5000 -runs 10
 package main
 
 import (
@@ -74,6 +80,7 @@ func main() {
 	flag.DurationVar(&o.maxLoad, "max-load", 3*time.Second, "longest time under load before the crash")
 	failover := flag.String("failover", "", "replication failover test instead: variants plain,wait,slowlink,slowlink+wait")
 	clusterFailover := flag.String("cluster-failover", "", "cluster failover timing instead: node timeouts in ms, e.g. 2000,5000")
+	partition := flag.String("partition", "", "network partition (split-brain window) test instead: node timeouts in ms")
 	flag.Parse()
 	o.policies, o.modes = strings.Split(policies, ","), strings.Split(modes, ",")
 	if *failover != "" {
@@ -82,6 +89,10 @@ func main() {
 	}
 	if *clusterFailover != "" {
 		runClusterFailover(o, strings.Split(*clusterFailover, ","))
+		return
+	}
+	if *partition != "" {
+		runPartition(o, strings.Split(*partition, ","))
 		return
 	}
 
