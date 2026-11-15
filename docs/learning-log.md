@@ -1324,3 +1324,217 @@ Prometheus scrapes, so it costs nothing between scrapes."
 
 2. The observer refuses admin actions if any node isn't on a loopback address. Why that rule?
 <details><summary>Answer</summary>The actions kill and freeze real processes. On a laptop running the local cluster, that's the demo. Pointed at a shared Kubernetes cluster, the same button would take down real pods for everyone. "Every node is on this machine" is a simple, checkable stand-in for "this is your own throwaway cluster".</details>
+
+## Iteration 16: Website skeleton + "Where does my key live?"
+
+**What we built**
+The showcase website (React + Vite + TypeScript). Its hero replays recorded chaos runs: six
+nodes, gossip dots, SUSPECTED/FAIL badges, the slot map, and a plain-English log ("d won the
+election: now primary of 5461 slots"), with play / pause / step / speed and deep links. Live
+mode shows your local cluster through the observer, with real per-node ops/s. "Where does my
+key live?" walks a key through UTF-8 bytes → hash tag → CRC16 byte by byte → mod 16384 → owner.
+
+**How it works**
+```
+ trace.json (make chaos) ─┐                         ┌─ ClusterView (pairs in fixed columns:
+                          ├─► Replayer.at(t) ──►    │    role = fill, badges = state)
+ observer /ws (live) ─────┘   ClusterState          ├─ SlotMap (128×128, colour = owner)
+                              roles, owners,        ├─ event log (plain English)
+                              PFAIL/FAIL, minority  └─ "Where does my key live?" (owner now)
+ keyslot.ts (CRC16-XMODEM)  ⇄  keyslot.vectors.json  ⇄  Go internal/keyslot  (both tested)
+```
+
+**Why we did it this way**
+- **A static replay site plus an optional local live mode (ADR 047),** not hand-made
+  animations or a hosted demo cluster. It's honest, free to host, and an interviewer can step
+  through it.
+- **The browser computes slots itself, locked to the server by shared vectors (ADR 048).**
+- **Traffic dots in replays split the recorded rate by slot ownership (ADR 049, your call).**
+  It's footnoted; Live mode uses real per-node rates.
+- **A professional, neutral look:** a validated colourblind-safe palette, one colour per shard,
+  red reserved for failures, chosen light *and* dark themes. No borrowed branding (copying
+  Redis's would mean imitating a real company).
+
+**What can go wrong**
+- **Replays can only show recorded events,** and the model shows one badge per node rather
+  than every node's opinion.
+- **Found by looking at screenshots:**
+  - In a partition, the cut-off node suspects everyone, and the first version showed that as
+    fact (healthy nodes badged SUSPECTED). Now only suspicion from healthy nodes counts, and
+    hearing from a suspect clears it.
+  - Framer Motion couldn't animate a fill between CSS variables, so a new primary rendered
+    white with an invisible name.
+  - A dead former primary was labelled "replica".
+  - A framer-motion / motion-dom version mismatch broke the production build.
+- **Headless Chrome traps (not site bugs):** it won't make a window narrower than 500 px (the
+  "overflow" at 390 px was a cropped 500 px page; a 390 px iframe showed the real layout), and
+  its virtual clock freezes CSS transitions mid-way.
+
+**Try it yourself**
+```
+make web-dev                                    # http://127.0.0.1:5174
+open "http://127.0.0.1:5174/?scenario=kill-primary&t=6.3"            # the moment d wins
+open "http://127.0.0.1:5174/?scenario=partition-minority-primary&t=5.4"
+make cluster-up-local && bin/shardis-observer &   # then the Live tab: real ops/s per node
+make web-test                                   # 7 tests incl. the shared CRC16 vectors
+```
+
+**Interview question you can now answer**
+*"How do you make a visualization of a distributed system that people can trust?"*
+"Don't animate what you think happens, replay what did happen. My site plays traces recorded
+from real runs: every node's own events plus what the chaos tool did, and the page rebuilds the
+cluster's state at any moment from them. It also doesn't overclaim. When the trace only had
+totals, I said so on the page, and when the model showed a cut-off node's suspicions as fact,
+that was a bug and I fixed it. The key-to-slot calculator runs the same algorithm as the
+server, with a shared test-vector file that both test suites check."
+
+**Check yourself**
+1. Why does each primary/replica pair keep a fixed position instead of drawing primaries on top?
+<details><summary>Answer</summary>So change is visible. If nodes moved when roles changed, a failover would look like a reshuffle. With fixed positions, a failover is one thing happening: the fill moving from a to d in the same column, with the slots, and the slot map keeping its colour.</details>
+
+2. In the partition replay, why aren't b, c and e marked SUSPECTED, although the trace contains PFAIL events about them?
+<details><summary>Answer</summary>Those PFAILs come from a, the node that's cut off. From its side, everyone vanished. A node is shown as suspected only if a healthy node (not partitioned, in a minority, down or failed) suspects it. Otherwise the page would present the minority's view as the truth.</details>
+
+> **Update (Iteration 17):** this first page was rebuilt. It explained too little in the first
+> five seconds, and the look was too plain. The replay view described above survives as
+> section 6, "Real runs". The key calculator moved into scene 1. The site is now dark-only.
+
+## Iteration 17: The distributed-systems story, section by section
+
+**What we built**
+The site became a story in eleven sections: one shopper's write, millions of requests, TTL
+and LRU, MOVED/ASK redirects, and "kill a machine" (all interactive simulations), followed by
+the proof. That's recorded chaos replays, a Kubernetes section (pods you can roll, six config
+cards that pop out with what matters in each file, and a replay of a real terminal session),
+seven benchmark charts against Redis, all 51 design decisions as searchable cards, "what I'd
+change at a thousand nodes", and an honest scorecard. A GitHub Actions workflow publishes it
+to GitHub Pages.
+
+**How it works**
+```
+ 1 one request ─┐  canvas scenes (scenes.js):         6 real runs ── traces from make chaos
+ 2 millions     │  real CRC16 + measured timings,     7 kubernetes ─ real minikube output
+ 3 TTL / LRU    ├─ animate only while visible,        8 benchmarks ─ docs/benchmarks/*
+ 4 redirects    │  reduced-motion aware               9 decisions ── docs/decisions/*.md
+ 5 break it   ──┘                                                   → decisions.json (build)
+        "how it works"  ───────────────────────►  "here's the proof"
+```
+Every section has an interactive part: type a key, write 40 keys, kill A / cut B off / heal,
+scrub a recording, roll the StatefulSet, open a config card, search the decisions.
+
+**Why we did it this way**
+- **Story by simulation, proof by recording (ADR 050).** Replays alone were accurate, but
+  nobody could read them cold. Simulations alone would raise "is this real?". So the page
+  does both and labels which is which. The simulations use the server's own slot algorithm
+  and measured timings.
+- **Decision cards are generated from the ADR files at build time (ADR 051),** so the site
+  can't drift from the docs, and a test parses every real record.
+- **A terminal replay instead of a GIF** for Kubernetes: it's text, so it's sharp at any size,
+  searchable and tiny. It's labelled "real output (condensed)".
+- **Charts are plain HTML bars, not D3:** horizontal bars with a label on every bar, one
+  scale per chart, and the source path under each. D3 would have been a dependency for
+  nothing.
+- **The roadmap's ten sections were merged where that read better.** Replication and partition
+  live inside "Break it" plus the lost-writes chart. Resharding is the ASK half of the
+  redirects scene plus the rebalance chart. Persistence and eviction are the TTL scene plus
+  two charts.
+
+**What can go wrong**
+- **Simulated timings can drift from the real server.** The recorded replays on the same page
+  are the check.
+- **Hand-written canvas code is harder to test** than React components. Tests cover what
+  carries facts: slot maths (shared vectors), the replay model, the ADR parser.
+- **Found in screenshots:**
+  - A config card's detail opened *behind* the fanned deck (Dhananjay caught it). The detail
+    now sits on top, and the deck dims.
+  - Decision cards said "Option 1." with no explanation, so the parser now names the option.
+  - Replay node labels collided on phones: the CSS for the short labels was lost in the
+    restyle.
+  - In the redirects scene, the request badge covered the client's label.
+- **Publishing needs two manual steps:** enable Pages in the repo settings, and add the link
+  on djism.github.io. Both are outward-facing, so they're Dhananjay's to do.
+
+**Try it yourself**
+```
+make web-dev        # http://127.0.0.1:5174: scroll the story, click "Kill primary A"
+make web-test       # 12 tests: CRC16 vectors, replay model, ADR parser on all 51 records
+make web-build      # website/dist (static; works from any sub-path)
+# Publish: GitHub → Settings → Pages → Source: GitHub Actions, then push to main
+```
+
+**Interview question you can now answer**
+*"How would you explain a distributed system to a non-expert without lying to them?"*
+"Simplify the picture, not the facts. My site walks one request through the cluster with
+an animation that uses the real hash function and the real measured timings: 2 s to suspect,
+about 3 s to fail over. Then it shows the recorded runs of the same thing, and benchmark charts
+including where I lose to Redis. Every simulated scene is labelled as a simulation. If the
+simple story and the recording ever disagree, the recording wins."
+
+**Check yourself**
+1. Why are the decision cards generated at build time instead of written into the page?
+<details><summary>Answer</summary>So they can't drift. The markdown ADRs are the source of truth; every build parses them again, and a test fails if any record is malformed. Hand-copied cards would go stale the first time an ADR changed.</details>
+
+2. The "kill a machine" scene is a simulation. What on the page shows that it matches reality?
+<details><summary>Answer</summary>The "Real runs" section replays the recorded kill-primary chaos run: the same PFAIL → FAIL → vote → promotion sequence, from seven real processes, with the checker's results (operations, client errors, rolled-back writes). The failover chart gives the measured times across 20 runs.</details>
+
+## Iteration 18: Final polish
+
+**What we built**
+The front door to the project: a README with a 30-second pitch table, an architecture
+diagram (mermaid plus a per-node sketch), the site screenshot and "run it in 2 commands". Plus
+`docs/DESIGN.md`, a Google-style design doc (goals, non-goals, design, alternatives, a failure
+mode table, testing, future work), a timed 5-minute demo script, and resume bullets in which
+every number links back to a benchmark.
+
+**How it works**
+```
+ recruiter (30 s) ──► README pitch table + site link
+ engineer (10 min) ─► site story → Real runs → Benchmarks → Scorecard
+ interviewer (1 h) ─► DESIGN.md §7 failure modes → ADRs → docs/benchmarks raw data
+```
+Each layer links to the next one down, so any claim can be followed to the raw CSV.
+
+**Why we did it this way**
+- **Numbers over adjectives:** the README's first table is six measured claims, including a
+  bad one (2,029 rolled-back writes). A senior reader trusts a project more once it admits a
+  cost.
+- **The quickstart was actually run before it was written down.** `make cluster-up-local`,
+  then `redis-cli -c -p 7001 set user:42 hello` gave OK. Then `kill -9` primary a: d took
+  over in 3.17 s with a 2 s timeout, matching the 3.07 s median. That run also caught a wrong
+  estimate in the draft: it said ~16 s for the default timeout, and the honest answer is
+  15–20 s.
+- **DESIGN.md is the "why" in one place** for someone who won't read 51 ADRs. Each section
+  ends in the ADR numbers if they want depth.
+
+**What can go wrong**
+- **Docs drift from code.** The ADR cards are generated (ADR 051), but README, DESIGN.md and
+  resume numbers are hand-copied from `docs/benchmarks`. A future change that moves a number
+  must update them too.
+- **The site link stays dead until GitHub Pages is enabled** (Settings → Pages → Source:
+  GitHub Actions). Linking it from djism.github.io is a manual step.
+- **Port 7000 on macOS:** the quickstart uses 7001, because AirPlay Receiver owns *:7000 and
+  `redis-cli -p 7000` can hang before node a binds.
+
+**Try it yourself**
+```
+make cluster-up-local && redis-cli -c -p 7001 set user:42 hello   # the README's 2 commands
+kill -9 $(cat .cluster-local/a.pid); redis-cli -p 7001 cluster nodes   # watch d take over
+make cluster-down-local
+open docs/DESIGN.md docs/demo-script.md docs/resume.md
+```
+
+**Interview question you can now answer**
+*"What's the weakest part of your system?"*
+"Partitions. Redis Cluster, and Shardis, let a cut-off primary keep accepting writes until it
+notices it's in the minority, which takes about the node timeout. Those writes are acknowledged
+and then rolled back when it rejoins. I measured 2,029 of them in one Kubernetes partition, and
+my checker caught it even though the final state looked fine. You can shrink the window with a
+shorter timeout or WAIT, but to close it you need consensus on slot ownership, like Raft. That's
+the first thing I'd change at scale."
+
+**Check yourself**
+1. Why does the README lead with a table of numbers, including a bad one?
+<details><summary>Answer</summary>Because claims without numbers read as marketing, and a project that only reports wins looks like it didn't measure the losses. Showing the 2,029 rolled-back writes next to the 0-error result proves the measurements are real and that I understand the design's tradeoff.</details>
+
+2. Which documents are generated and which are hand-maintained, and what's the risk?
+<details><summary>Answer</summary>The site's decision cards are generated from docs/decisions at build time. README, DESIGN.md, the demo script, the resume bullets and the site's benchmark numbers are copied from docs/benchmarks by hand. If a later change moves a number (say, failover gets faster), those copies must be updated, or they'll drift.</details>

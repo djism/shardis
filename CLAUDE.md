@@ -144,7 +144,11 @@ deploy/local/         6-node cluster as local processes (cluster.sh, topology.co
 deploy/compose/       docker-compose 6-node cluster (Dockerfile at repo root)
 deploy/k8s/           StatefulSet, headless Service, ConfigMap, PDB, bootstrap + checker Jobs, NetworkPolicy
 deploy/k8s/demos/     up.sh, failover.sh, rolling-restart.sh, partition.sh, scale.sh, down.sh
-website/              showcase site (React + Vite + TypeScript)
+website/              showcase site (React + Vite + TS + Tailwind): story scenes on canvas
+                      (src/scenes/scenes.js, simulations, ADR 050), Replay of public/traces +
+                      Live via the observer (src/sections/Replay.tsx, src/lib/model.ts), k8s,
+                      benchmarks, decision cards generated from docs/decisions
+docs/DESIGN.md        design doc;  docs/demo-script.md (5 min);  docs/resume.md (bullets)
 docs/decisions/       design decision records
 docs/benchmarks/      benchmark results (raw + summary)
 docs/learning-log.md  all iteration recaps
@@ -157,6 +161,11 @@ ROADMAP.md            iteration plan
 make help         # list all targets
 make build        # build binaries (bin/shardis, -loadgen, -crashtest, -admin, -chaos)
 make chaos        # every chaos scenario: report table, docs/benchmarks/iter-13-chaos/report.csv, traces (~5 min)
+make web-dev      # website at http://127.0.0.1:5174 (?scenario=kill-primary&t=6.3, ?mode=live)
+make web-test     # website typecheck + tests (CRC16 vectors, replay model, ADR parser)
+make web-build    # → website/dist; .github/workflows/pages.yml publishes it to GitHub Pages
+                  # decision cards come from docs/decisions/*.md (website/scripts/decisions.mjs, ADR 051)
+SHARDIS_WRITE_VECTORS=1 go test ./internal/keyslot -run TestSharedVectors   # regenerate browser CRC16 vectors
                   # bin/shardis-chaos -list | -scenarios kill-primary,slow-node
 make test         # go test -race ./...
 make test-memory  # heap-measuring tests (skipped under -race; CI runs both)
