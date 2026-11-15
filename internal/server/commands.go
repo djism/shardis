@@ -128,7 +128,7 @@ func (s *Server) dispatch(cl *client, args [][]byte) {
 	cl.cmds.Add(1)
 	// Cluster routing comes first: a command for a slot we don't serve gets
 	// redirected before anything else looks at it (ADR 022).
-	if s.topo != nil {
+	if s.cluster != nil {
 		if keys := cmd.keysOf(args); len(keys) > 0 {
 			if redirect := s.route(cl, cmd, keys); redirect != "" {
 				cl.w.WriteError(redirect)

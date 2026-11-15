@@ -67,6 +67,7 @@ func TestParse(t *testing.T) {
 		"repl.stream pause":           "repl.stream pause",
 		"REPL.STREAM delay 50 r1":     "repl.stream delay 50 r1",
 		"repl.stream sever 1.2.3.4:5": "repl.stream sever 1.2.3.4:5",
+		"bus.message drop b":          "bus.message drop b",
 	}
 	for in, want := range good {
 		r, err := Parse(splitWords(in))
@@ -74,7 +75,8 @@ func TestParse(t *testing.T) {
 			t.Errorf("Parse(%q) = %q, %v", in, r.String(), err)
 		}
 	}
-	for _, in := range []string{"", "nope pause", "repl.stream delay", "repl.stream delay x", "repl.stream wobble"} {
+	for _, in := range []string{"", "nope pause", "repl.stream delay", "repl.stream delay x", "repl.stream wobble",
+		"repl.stream drop", "bus.message pause"} {
 		if _, err := Parse(splitWords(in)); err == nil {
 			t.Errorf("Parse(%q) should fail", in)
 		}

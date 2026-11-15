@@ -66,18 +66,22 @@ func startCluster(t *testing.T) *testCluster {
 		engine, _ := store.New(store.EngineSharded, store.Options{})
 		node := replication.NewNode(replication.Options{Engine: engine, PingPeriod: 100 * time.Millisecond,
 			Timeout: 2 * time.Second, AnnouncePort: ports[n], Log: quiet})
-		s := New(Options{Engine: engine, Repl: node, Cluster: topo, Port: ports[n], Hz: 10, Log: quiet})
+		addr := fmt.Sprintf("127.0.0.1:%d", ports[n])
+		cl, err := cluster.New(cluster.Options{ClientAddr: addr, InternalAddr: addr, Seed: topo,
+			NodeTimeout: 2 * time.Second, Replicator: node, Log: quiet})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := New(Options{Engine: engine, Repl: node, Cluster: cl, Port: ports[n], Hz: 10, Log: quiet})
 		if err := s.Listen(fmt.Sprintf("127.0.0.1:%d", ports[n])); err != nil {
 			t.Fatal(err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() { s.Serve(ctx); close(done) }()
-		t.Cleanup(func() { node.Close(); cancel(); <-done; engine.Close() })
-		if !topo.Me.IsPrimary() {
-			if err := node.ReplicaOf("127.0.0.1", ports[topo.Me.Primary.Name]); err != nil {
-				t.Fatal(err)
-			}
+		t.Cleanup(func() { cl.Close(); node.Close(); cancel(); <-done; engine.Close() })
+		if err := cl.Start(); err != nil { // replicas start replicating from here
+			t.Fatal(err)
 		}
 		tc.nodes[n] = &clusterNode{name: n, addr: fmt.Sprintf("127.0.0.1:%d", ports[n]), port: ports[n]}
 	}
@@ -90,12 +94,20 @@ func startCluster(t *testing.T) *testCluster {
 	return tc
 }
 
+// freePort returns a port p where p and p+10000 (its cluster bus) are both free.
 func freePort(t *testing.T) int {
 	t.Helper()
-	for range 100 {
+	for range 200 {
 		p := 20000 + rand.IntN(20000) // a real random source: clock-based ports collided
-		if ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p)); err == nil {
-			ln.Close()
+		a, err1 := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		b, err2 := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p+10000))
+		if a != nil {
+			a.Close()
+		}
+		if b != nil {
+			b.Close()
+		}
+		if err1 == nil && err2 == nil {
 			return p
 		}
 	}
@@ -182,7 +194,13 @@ func TestClusterCommands(t *testing.T) {
 	}
 	nodes, _ := strconv.Unquote(a.do("CLUSTER", "NODES"))
 	lines := strings.Split(strings.TrimSpace(nodes), "\n")
-	if len(lines) != 6 || !strings.Contains(lines[0], "myself,master") || !strings.HasSuffix(lines[0], "0-5460") {
+	mine := ""
+	for _, l := range lines {
+		if strings.Contains(l, "myself") {
+			mine = l
+		}
+	}
+	if len(lines) != 6 || !strings.Contains(mine, "myself,master") || !strings.HasSuffix(mine, "0-5460") {
 		t.Fatalf("NODES:\n%s", nodes)
 	}
 	info, _ := strconv.Unquote(a.do("CLUSTER", "INFO"))

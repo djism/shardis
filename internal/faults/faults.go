@@ -9,6 +9,7 @@
 //	FAULT SET repl.stream pause            pause the stream to every replica
 //	FAULT SET repl.stream delay 50 r1      add 50 ms before each chunk to replica r1
 //	FAULT SET repl.stream sever            drop replication links (they reconnect)
+//	FAULT SET bus.message drop b           drop cluster bus messages to node b
 //	FAULT CLEAR [point]
 //
 // "Deterministic" means a fault happens exactly when and where the rule
@@ -33,9 +34,21 @@ const (
 	// ReplStream is checked by the primary before sending each chunk of the
 	// replication stream to a replica. Target = the replica's ID (host:port).
 	ReplStream Point = "repl.stream"
+	// BusMessage is checked before sending each cluster bus message.
+	// Target = the receiving node's name or ID. Dropping messages in both
+	// directions between two nodes is how tests fake a network partition.
+	BusMessage Point = "bus.message"
 )
 
-var knownPoints = []Point{ReplStream}
+var knownPoints = []Point{ReplStream, BusMessage}
+
+// allowed lists the kinds that make sense at each point. Dropping bytes from
+// the middle of a replication stream would corrupt it (use sever instead);
+// bus messages are independent, so they can be dropped one by one.
+var allowed = map[Point][]Kind{
+	ReplStream: {Pause, Delay, Sever},
+	BusMessage: {Drop, Delay},
+}
 
 // Kind is what a rule does.
 type Kind int
@@ -44,9 +57,10 @@ const (
 	Pause Kind = iota // block until the rule is cleared
 	Delay             // sleep before proceeding
 	Sever             // tell the caller to drop the connection
+	Drop              // tell the caller to discard this one message
 )
 
-var kindNames = [...]string{"pause", "delay", "sever"}
+var kindNames = [...]string{"pause", "delay", "sever", "drop"}
 
 // Rule is one active fault.
 type Rule struct {
@@ -83,9 +97,10 @@ func New() *Registry {
 }
 
 // Check applies any rule matching (p, target): it sleeps for Delay, blocks
-// while a Pause rule is active, and returns sever=true for a Sever rule.
-// stop, if non-nil, ends a pause early (e.g. the connection closed).
-func (r *Registry) Check(p Point, target string, stop <-chan struct{}) (sever bool) {
+// while a Pause rule is active, and returns true for Sever or Drop (the
+// caller cuts the connection or discards the message). stop, if non-nil,
+// ends a pause early (e.g. the connection closed).
+func (r *Registry) Check(p Point, target string, stop <-chan struct{}) (cut bool) {
 	if r == nil || !r.active.Load() {
 		return false
 	}
@@ -97,7 +112,7 @@ func (r *Registry) Check(p Point, target string, stop <-chan struct{}) (sever bo
 			return false
 		}
 		switch rule.Kind {
-		case Sever:
+		case Sever, Drop:
 			return true
 		case Delay:
 			r.mu.Unlock()
@@ -176,6 +191,8 @@ func Parse(args []string) (Rule, error) {
 		rule.Kind = Pause
 	case "sever":
 		rule.Kind = Sever
+	case "drop":
+		rule.Kind = Drop
 	case "delay":
 		if len(rest) == 0 {
 			return Rule{}, fmt.Errorf("delay needs milliseconds")
@@ -194,6 +211,9 @@ func Parse(args []string) (Rule, error) {
 		rule.Target = rest[0]
 	default:
 		return Rule{}, fmt.Errorf("too many arguments")
+	}
+	if !slices.Contains(allowed[rule.Point], rule.Kind) {
+		return Rule{}, fmt.Errorf("%s can't be applied to %s", kindNames[rule.Kind], rule.Point)
 	}
 	return rule, nil
 }

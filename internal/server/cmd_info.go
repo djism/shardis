@@ -28,7 +28,7 @@ var infoSections = []struct {
 	{"memory", infoMemory},
 	{"persistence", infoPersistence},
 	{"replication", infoReplication},
-	{"cluster", func(b *strings.Builder, s *Server) { field(b, "cluster_enabled", boolInt(s.topo != nil)) }},
+	{"cluster", func(b *strings.Builder, s *Server) { field(b, "cluster_enabled", boolInt(s.cluster != nil)) }},
 	{"stats", infoStats},
 	{"keyspace", infoKeyspace},
 }

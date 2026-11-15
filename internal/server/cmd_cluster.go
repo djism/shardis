@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/djism/shardis/internal/cluster"
 	"github.com/djism/shardis/internal/keyslot"
@@ -26,7 +27,11 @@ func (s *Server) route(cl *client, cmd command, keys [][]byte) string {
 			return errCrossSlot
 		}
 	}
-	owner, me := s.topo.Owner(slot), s.topo.Me
+	t := s.cluster.View() // one lock-free snapshot for the whole decision (ADR 026)
+	owner, me := t.Owner(slot), t.Me
+	if owner == nil {
+		return "CLUSTERDOWN Hash slot not served"
+	}
 	if owner == me {
 		return ""
 	}
@@ -34,7 +39,7 @@ func (s *Server) route(cl *client, cmd command, keys [][]byte) string {
 		return "" // a read on a replica, which the client asked for
 	}
 	if s.bus.Active() {
-		s.bus.Emit("moved", map[string]any{"slot": slot, "to": owner.Name, "addr": owner.Addr})
+		s.bus.Emit("moved", map[string]any{"slot": slot, "to": owner.Label(), "addr": owner.Addr})
 	}
 	return fmt.Sprintf("MOVED %d %s", slot, owner.Addr)
 }
@@ -56,7 +61,7 @@ func cmdReadWrite(cl *client, _ [][]byte) {
 }
 
 func clusterDisabled(cl *client) bool {
-	if cl.srv.topo == nil {
+	if cl.srv.cluster == nil {
 		cl.w.WriteError("ERR This instance has cluster support disabled")
 		return true
 	}
@@ -69,9 +74,62 @@ func cmdCluster(cl *client, args [][]byte) {
 	if clusterDisabled(cl) {
 		return
 	}
-	t := cl.srv.topo
+	c := cl.srv.cluster
+	t := c.View()
 	sub := strings.ToUpper(string(args[1]))
 	switch {
+	case sub == "MEET" && (len(args) == 4 || len(args) == 5):
+		port, err := strconv.Atoi(string(args[3]))
+		bus := 0
+		if len(args) == 5 {
+			bus, _ = strconv.Atoi(string(args[4]))
+		}
+		if err != nil || port < 1 || port > 65535 {
+			cl.w.WriteError("ERR Invalid base port specified: " + string(args[3]))
+			return
+		}
+		replyOK(cl, c.Meet(string(args[2]), port, bus))
+	case sub == "ADDSLOTS" && len(args) >= 3:
+		slots := make([]uint16, 0, len(args)-2)
+		for _, a := range args[2:] {
+			s, ok := parseSlot(cl, a)
+			if !ok {
+				return
+			}
+			slots = append(slots, s)
+		}
+		replyOK(cl, c.AddSlots(slots))
+	case sub == "ADDSLOTSRANGE" && len(args) >= 4 && len(args)%2 == 0:
+		var slots []uint16
+		for i := 2; i < len(args); i += 2 {
+			lo, ok1 := parseSlot(cl, args[i])
+			if !ok1 {
+				return
+			}
+			hi, ok2 := parseSlot(cl, args[i+1])
+			if !ok2 {
+				return
+			}
+			if lo > hi {
+				cl.w.WriteError(fmt.Sprintf("ERR start slot number %d is greater than end slot number %d", lo, hi))
+				return
+			}
+			for s := int(lo); s <= int(hi); s++ {
+				slots = append(slots, uint16(s))
+			}
+		}
+		replyOK(cl, c.AddSlots(slots))
+	case sub == "REPLICATE" && len(args) == 3:
+		replyOK(cl, c.Replicate(string(args[2])))
+	case sub == "FORGET" && len(args) == 3:
+		replyOK(cl, c.Forget(string(args[2])))
+	case sub == "SET-CONFIG-EPOCH" && len(args) == 3:
+		e, err := strconv.ParseUint(string(args[2]), 10, 64)
+		if err != nil {
+			cl.w.WriteError("ERR Invalid config epoch specified: " + string(args[2]))
+			return
+		}
+		replyOK(cl, c.SetConfigEpoch(e))
 	case sub == "KEYSLOT" && len(args) == 3:
 		cl.w.WriteInt(int64(keyslot.Of(args[2])))
 	case sub == "MYID" && len(args) == 2:
@@ -83,7 +141,7 @@ func cmdCluster(cl *client, args [][]byte) {
 	case sub == "NODES" && len(args) == 2:
 		cl.w.WriteBulkString(clusterNodes(t))
 	case sub == "INFO" && len(args) == 2:
-		cl.w.WriteBulkString(clusterInfo(t))
+		cl.w.WriteBulkString(clusterInfo(t, c.Stats()))
 	case sub == "COUNTKEYSINSLOT" && len(args) == 3:
 		slot, ok := parseSlot(cl, args[2])
 		if !ok {
@@ -111,6 +169,14 @@ func cmdCluster(cl *client, args [][]byte) {
 	default:
 		cl.w.WriteError(fmt.Sprintf("ERR unknown subcommand or wrong number of arguments for '%s'. Try CLUSTER HELP.", truncate(args[1], 128)))
 	}
+}
+
+func replyOK(cl *client, err error) {
+	if err != nil {
+		cl.w.WriteError("ERR " + err.Error())
+		return
+	}
+	cl.w.WriteSimple("OK")
 }
 
 func parseSlot(cl *client, b []byte) (uint16, bool) {
@@ -177,23 +243,42 @@ func clusterShards(cl *client, t *cluster.Topology) {
 
 // clusterNodes is the CLUSTER NODES text: one line per node,
 //
-//	<id> <ip:port@busport> <flags> <primary-id|-> <ping-sent> <pong-recv> <config-epoch> <link-state> <slots...>
+//	<id> <ip:port@busport> <flags> <primary-id|-> <ping-sent-ms> <pong-recv-ms> <config-epoch> <link-state> <slots...>
 //
-// redis-cli --cluster and redis-benchmark --cluster parse this to find nodes.
-// The bus port (port + 10000) isn't listening yet; that's Iteration 8.
+// redis-cli --cluster and redis-benchmark --cluster parse this. ping-sent is
+// when our current unanswered PING went out (0 = none), pong-recv when we
+// last heard from the node, both in Unix ms, as in Redis.
 func clusterNodes(t *cluster.Topology) string {
 	var b strings.Builder
 	for _, n := range t.Nodes {
 		host, port := n.HostPort()
-		flags := "master"
-		primary := "-"
-		if !n.IsPrimary() {
-			flags, primary = "slave", n.Primary.ID
-		}
+		var flags []string
 		if n == t.Me {
-			flags = "myself," + flags
+			flags = append(flags, "myself")
 		}
-		fmt.Fprintf(&b, "%s %s:%d@%d %s %s 0 0 %d connected", n.ID, host, port, port+10000, flags, primary, n.Epoch)
+		primary := "-"
+		if n.IsPrimary() {
+			flags = append(flags, "master")
+		} else {
+			flags = append(flags, "slave")
+			if n.Primary != nil {
+				primary = n.Primary.ID
+			}
+		}
+		for _, f := range []struct {
+			bit  uint16
+			name string
+		}{{cluster.FlagPFail, "fail?"}, {cluster.FlagFail, "fail"}, {cluster.FlagHandshake, "handshake"}} {
+			if n.Has(f.bit) {
+				flags = append(flags, f.name)
+			}
+		}
+		link := "connected"
+		if !n.LinkUp {
+			link = "disconnected"
+		}
+		fmt.Fprintf(&b, "%s %s:%d@%d %s %s %d %d %d %s", n.ID, host, port, n.BusPort, strings.Join(flags, ","),
+			primary, unixMs(n.PingSent), unixMs(n.PongRecv), n.Epoch, link)
 		for _, r := range n.Slots {
 			if r.Start == r.End {
 				fmt.Fprintf(&b, " %d", r.Start)
@@ -206,20 +291,38 @@ func clusterNodes(t *cluster.Topology) string {
 	return b.String()
 }
 
-func clusterInfo(t *cluster.Topology) string {
+func unixMs(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
+}
+
+func clusterInfo(t *cluster.Topology, st *cluster.Stats) string {
+	state := "fail"
+	if t.StateOK() {
+		state = "ok"
+	}
+	size := 0
+	for _, n := range t.Primaries() {
+		if len(n.Slots) > 0 {
+			size++
+		}
+	}
 	var b strings.Builder
 	for _, kv := range [][2]string{
-		{"cluster_state", "ok"},
-		{"cluster_slots_assigned", strconv.Itoa(keyslot.Count)},
-		{"cluster_slots_ok", strconv.Itoa(keyslot.Count)},
+		{"cluster_state", state},
+		{"cluster_slots_assigned", strconv.Itoa(t.AssignedSlots())},
+		{"cluster_slots_ok", strconv.Itoa(t.AssignedSlots())},
 		{"cluster_slots_pfail", "0"},
 		{"cluster_slots_fail", "0"},
 		{"cluster_known_nodes", strconv.Itoa(len(t.Nodes))},
-		{"cluster_size", strconv.Itoa(len(t.Primaries()))},
-		{"cluster_current_epoch", strconv.Itoa(t.MaxEpoch())},
-		{"cluster_my_epoch", strconv.Itoa(t.Me.Epoch)},
-		{"cluster_stats_messages_sent", "0"},
-		{"cluster_stats_messages_received", "0"},
+		{"cluster_size", strconv.Itoa(size)},
+		{"cluster_current_epoch", strconv.FormatUint(t.CurrentEpoch, 10)},
+		{"cluster_my_epoch", strconv.FormatUint(t.Me.Epoch, 10)},
+		{"cluster_stats_messages_sent", strconv.FormatInt(st.Sent.Load(), 10)},
+		{"cluster_stats_messages_received", strconv.FormatInt(st.Received.Load(), 10)},
+		{"cluster_stats_messages_dropped", strconv.FormatInt(st.Dropped.Load(), 10)},
 	} {
 		fmt.Fprintf(&b, "%s:%s\r\n", kv[0], kv[1])
 	}

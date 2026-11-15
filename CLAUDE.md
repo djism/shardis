@@ -130,7 +130,7 @@ internal/store/       in-memory keyspace (one map per hash slot), engines (shard
 internal/keyslot/     CRC16 + hash tags → slot (verified against real Redis)
 internal/persist/     AOF (effects log, group commit, fsync policies), manifest, fuzzy rewrite
 internal/replication/ PSYNC, backlog, full/partial sync, WAIT, promotion
-internal/cluster/     topology (slot → node), later: cluster bus, gossip, failover, resharding
+internal/cluster/     topology snapshots, cluster bus (wire format, gossip), nodes.conf; later failover, resharding
 internal/events/      event bus
 internal/faults/      deterministic fault injection (FAULT SET repl.stream pause|delay|sever)
 pkg/client/           our own "smart" cluster client
@@ -162,7 +162,9 @@ make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* en
                   #   (warns below 32mb: the 16384 slot maps alone use ~9-14 MB)
                   # --appendonly yes --appendfsync everysec --dir /data  (ADR 014-016)
                   # --replicaof "host port"  --enable-fault-injection yes (testing only)
-                  # --cluster-config deploy/local/topology.conf --cluster-node a   (ADR 021-023)
+                  # --cluster-config deploy/local/topology.conf --cluster-node a   (seed file, ADR 021-023)
+                  # --cluster-enabled yes   (fresh node; form with CLUSTER MEET/ADDSLOTS/REPLICATE
+                  #   or redis-cli --cluster create; state saved in <dir>/nodes.conf, ADR 024-026)
 SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
 bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
 bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
@@ -175,6 +177,7 @@ bash docs/benchmarks/iter-05-persistence/run.sh   # crash table + throughput per
 bin/shardis-crashtest -failover plain,wait,slowlink,slowlink+wait   # replication lost-write window
 bash docs/benchmarks/iter-06-replication/run.sh   # the full failover table (~4 min)
 bash docs/benchmarks/iter-07-cluster/run.sh       # single node vs cluster, Shardis and Redis (~3 min)
+SHARDIS_GOSSIP_BENCH=$PWD/docs/benchmarks/iter-08-gossip/raw.csv go test ./internal/cluster -run TestGossipScaling -v -timeout 20m
 ```
 
 macOS note: AirPlay Receiver listens on *:7000. Binding 127.0.0.1:7000 (the default) works;

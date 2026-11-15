@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -96,16 +97,12 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 		AnnouncePort: cfg.Port, Faults: reg, Bus: bus, Log: slog.Default(),
 	})
 	defer repl.Close() // runs before aof.Close (defers are last-in-first-out)
-	var topo *cluster.Topology
-	if cfg.ClusterConfig != "" {
-		if topo, err = cluster.Load(cfg.ClusterConfig, cfg.ClusterNode); err != nil {
+	var cl *cluster.Cluster
+	if cfg.ClusterEnabled {
+		if cl, err = openCluster(cfg, repl, reg, bus); err != nil {
 			return err
 		}
-		slog.Info("cluster mode", "node", topo.Me.Name, "id", topo.Me.ID, "primary", topo.Me.IsPrimary(), "nodes", len(topo.Nodes))
-		if !topo.Me.IsPrimary() { // replicate from our primary's internal address
-			host, port, _ := net.SplitHostPort(topo.Me.Primary.Internal)
-			cfg.ReplicaOf = host + " " + port
-		}
+		defer cl.Close() // runs first at shutdown: leave the bus, save nodes.conf
 	}
 	if cfg.ReplicaOf != "" {
 		f := strings.Fields(cfg.ReplicaOf)
@@ -119,7 +116,7 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	}
 
 	srv := server.New(server.Options{Log: slog.Default(), Engine: engine, Evictor: evictor, AOF: aof,
-		Repl: repl, Faults: reg, Cluster: topo, Bus: bus, Port: cfg.Port, Hz: cfg.Hz})
+		Repl: repl, Faults: reg, Cluster: cl, Bus: bus, Port: cfg.Port, Hz: cfg.Hz})
 	if err := srv.Listen(addr); err != nil {
 		return err
 	}
@@ -156,4 +153,49 @@ func openAOF(cfg config.Config, engine store.Engine) (*persist.AOF, error) {
 		return nil, err
 	}
 	return aof, nil
+}
+
+// openCluster builds this node's cluster state (from nodes.conf if it has
+// run before, else the seed file, else fresh) and opens the cluster bus.
+func openCluster(cfg config.Config, repl *replication.Node, reg *faults.Registry, bus *events.Bus) (*cluster.Cluster, error) {
+	var seed *cluster.Topology
+	var err error
+	clientAddr, internalAddr := cfg.ClusterAnnounceAddr, cfg.ClusterAnnounceInternal
+	if cfg.ClusterConfig != "" {
+		if seed, err = cluster.Load(cfg.ClusterConfig, cfg.ClusterNode); err != nil {
+			return nil, err
+		}
+		if clientAddr == "" {
+			clientAddr = seed.Me.Addr
+		}
+		if internalAddr == "" {
+			internalAddr = seed.Me.Internal
+		}
+	}
+	if clientAddr == "" {
+		host := cfg.Host
+		if host == "0.0.0.0" || host == "" || host == "::" {
+			host = "127.0.0.1"
+		}
+		clientAddr = net.JoinHostPort(host, strconv.Itoa(cfg.Port))
+	}
+	if internalAddr == "" {
+		internalAddr = clientAddr
+	}
+	cl, err := cluster.New(cluster.Options{
+		ClientAddr: clientAddr, InternalAddr: internalAddr, Seed: seed,
+		StateFile:   filepath.Join(cfg.Dir, "nodes.conf"),
+		NodeTimeout: time.Duration(cfg.ClusterNodeTimeoutMs) * time.Millisecond,
+		Replicator:  repl, Faults: reg, Bus: bus, Log: slog.Default(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := cl.Start(); err != nil {
+		return nil, err
+	}
+	me := cl.View().Me
+	slog.Info("cluster mode", "id", me.ID, "name", me.Name, "client", me.Addr, "internal", me.Internal,
+		"bus_port", me.BusPort, "known_nodes", len(cl.View().Nodes))
+	return cl, nil
 }

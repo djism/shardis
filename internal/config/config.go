@@ -54,9 +54,14 @@ type Config struct {
 	ReplTimeoutMs        int // a silent link is dead after this long
 	EnableFaultInjection bool
 
-	// Cluster (ADR 021-023). Both set = cluster mode.
-	ClusterConfig string // path to the topology file
-	ClusterNode   string // this node's name in it
+	// Cluster (ADR 021-026). Cluster mode is on if ClusterEnabled, or if a
+	// seed topology file is given (then ClusterNode names this node in it).
+	ClusterEnabled          bool
+	ClusterConfig           string // path to a seed topology file (optional)
+	ClusterNode             string // this node's name in the seed file
+	ClusterAnnounceAddr     string // host:port clients are told; default: from seed, else listen addr
+	ClusterAnnounceInternal string // host:port other nodes use; default: from seed, else = announce addr
+	ClusterNodeTimeoutMs    int
 }
 
 // Load builds a Config from args (usually os.Args[1:]) and getenv (usually os.Getenv).
@@ -101,7 +106,14 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	str(fs, getenv, &faultsOn, "enable-fault-injection", "no", "enable the FAULT admin command (testing only)")
-	str(fs, getenv, &cfg.ClusterConfig, "cluster-config", "", "cluster topology file (enables cluster mode)")
+	var clusterOn string
+	str(fs, getenv, &clusterOn, "cluster-enabled", "no", "run as a cluster node (form the cluster with CLUSTER MEET/ADDSLOTS/REPLICATE)")
+	str(fs, getenv, &cfg.ClusterConfig, "cluster-config", "", "seed topology file (enables cluster mode)")
+	str(fs, getenv, &cfg.ClusterAnnounceAddr, "cluster-announce-addr", "", "host:port clients are told to use (MOVED, CLUSTER SLOTS)")
+	str(fs, getenv, &cfg.ClusterAnnounceInternal, "cluster-announce-internal", "", "host:port other nodes use to reach this one")
+	if err := integer(fs, getenv, &cfg.ClusterNodeTimeoutMs, "cluster-node-timeout", 15000, "ms without a reply before a node is suspected down"); err != nil {
+		return Config{}, err
+	}
 	str(fs, getenv, &cfg.ClusterNode, "cluster-node", "", "this node's name in the cluster topology file")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -129,10 +141,16 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if cfg.EnableFaultInjection, err = yesNo("enable-fault-injection", faultsOn); err != nil {
 		return Config{}, err
 	}
-	if (cfg.ClusterConfig == "") != (cfg.ClusterNode == "") {
-		return Config{}, fmt.Errorf("cluster mode needs both --cluster-config and --cluster-node")
+	if cfg.ClusterEnabled, err = yesNo("cluster-enabled", clusterOn); err != nil {
+		return Config{}, err
 	}
-	if cfg.ClusterConfig != "" && cfg.ReplicaOf != "" {
+	if (cfg.ClusterConfig == "") != (cfg.ClusterNode == "") {
+		return Config{}, fmt.Errorf("a seed topology needs both --cluster-config and --cluster-node")
+	}
+	if cfg.ClusterConfig != "" {
+		cfg.ClusterEnabled = true
+	}
+	if cfg.ClusterEnabled && cfg.ReplicaOf != "" {
 		return Config{}, fmt.Errorf("--replicaof can't be used in cluster mode; the topology file says who replicates whom")
 	}
 	if cfg.ReplicaOf != "" && len(strings.Fields(cfg.ReplicaOf)) != 2 {

@@ -1,9 +1,12 @@
-// Package cluster holds the cluster topology: which node owns which of the
-// 16384 hash slots, and who replicates whom.
+// Package cluster holds the cluster topology (which node owns which of the
+// 16384 hash slots, who replicates whom) and the cluster bus that keeps it
+// up to date by gossip.
 //
-// Iteration 7 reads it from a static file that is the same on every node
-// (ADR 021). Iteration 8's gossip will start from this file and keep it up
-// to date as nodes join, fail and take over slots.
+// A Topology is an immutable snapshot: the Cluster builds a new one whenever
+// something changes and swaps it in atomically, so every command can read it
+// without a lock (ADR 026). It can be seeded from a static file that is the
+// same on every node (ADR 021), or built at runtime with CLUSTER MEET /
+// ADDSLOTS / REPLICATE, the way Redis clusters are formed.
 //
 // File format, one node per line ('#' starts a comment):
 //
@@ -25,26 +28,50 @@ import (
 	"io"
 	"net"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/djism/shardis/internal/keyslot"
 )
 
-// Node is one member of the cluster.
+// Node is one member of the cluster, as of one snapshot.
 type Node struct {
-	Name     string
-	ID       string // 40 hex chars, derived from Name, like a Redis node ID
+	Name     string // from the seed file; "" for nodes met at runtime
+	ID       string // 40 hex chars
 	Addr     string // client-facing host:port
-	Internal string // node-to-node host:port
+	Internal string // node-to-node host:port (replication)
+	BusPort  int    // cluster bus port on the Internal host
 	Primary  *Node  // nil for primaries
 	Slots    []Range
 	Replicas []*Node
-	Epoch    int // config epoch; static for now (primaries numbered 1..N)
+	Epoch    uint64 // config epoch: the version of this node's slot claims
+	Flags    uint16 // Flag* bits
+	PingSent time.Time
+	PongRecv time.Time
+	LinkUp   bool // we have a working outbound bus connection to it
 }
 
-func (n *Node) IsPrimary() bool { return n.Primary == nil }
+// Node flags.
+const (
+	FlagMyself uint16 = 1 << iota
+	FlagPrimary
+	FlagReplica
+	FlagPFail     // we can't reach it (Iteration 9)
+	FlagFail      // the majority agrees it's down (Iteration 9)
+	FlagHandshake // met but not yet confirmed by a PONG
+)
+
+func (n *Node) IsPrimary() bool      { return n.Primary == nil && n.Flags&FlagReplica == 0 }
+func (n *Node) Has(flag uint16) bool { return n.Flags&flag != 0 }
+
+// Label is the name if there is one, else a short ID (for logs and events).
+func (n *Node) Label() string {
+	if n.Name != "" {
+		return n.Name
+	}
+	return n.ID[:8]
+}
 
 // HostPort splits the client address.
 func (n *Node) HostPort() (string, int) {
@@ -58,9 +85,10 @@ type Range struct{ Start, End uint16 }
 
 // Topology is the whole cluster as seen by one node.
 type Topology struct {
-	Nodes []*Node // in file order
-	Me    *Node
-	owner [keyslot.Count]*Node // slot → primary that serves it
+	Nodes        []*Node
+	Me           *Node
+	CurrentEpoch uint64
+	owner        [keyslot.Count]*Node // slot → primary that serves it (nil = nobody)
 }
 
 // NodeID derives a stable 40-hex-char ID from a node name.
@@ -104,7 +132,7 @@ func Parse(r io.Reader, me string) (*Topology, error) {
 		if f[0] != "node" || len(f) < 6 {
 			return nil, fmt.Errorf("line %d: want: node <name> <client-addr> <internal-addr> primary|replica ...", line)
 		}
-		n := &Node{Name: f[1], ID: NodeID(f[1]), Addr: f[2], Internal: f[3]}
+		n := &Node{Name: f[1], ID: NodeID(f[1]), Addr: f[2], Internal: f[3], Flags: FlagPrimary}
 		if byName[n.Name] != nil {
 			return nil, fmt.Errorf("line %d: duplicate node %q", line, n.Name)
 		}
@@ -142,9 +170,15 @@ func Parse(r io.Reader, me string) (*Topology, error) {
 			return nil, fmt.Errorf("line %d: %q is not a primary", p.line, p.primary)
 		}
 		p.n.Primary = prim
+		p.n.Flags = FlagReplica
 		prim.Replicas = append(prim.Replicas, p.n)
 	}
-	epoch := 0
+	for _, n := range t.Nodes {
+		_, port, _ := net.SplitHostPort(n.Internal)
+		p, _ := strconv.Atoi(port)
+		n.BusPort = p + 10000
+	}
+	var epoch uint64
 	for _, n := range t.Nodes {
 		if !n.IsPrimary() {
 			continue
@@ -173,6 +207,8 @@ func Parse(r io.Reader, me string) (*Topology, error) {
 	if t.Me = byName[me]; t.Me == nil {
 		return nil, fmt.Errorf("this node (%q) is not in the topology", me)
 	}
+	t.Me.Flags |= FlagMyself
+	t.CurrentEpoch = t.MaxEpoch()
 	return t, nil
 }
 
@@ -189,8 +225,40 @@ func parseRange(s string) (Range, error) {
 	return Range{uint16(a), uint16(b)}, nil
 }
 
-// Owner is the primary that serves slot s.
+// Owner is the primary that serves slot s, or nil if no node does.
 func (t *Topology) Owner(s uint16) *Node { return t.owner[s] }
+
+// StateOK is Redis's cluster_state:ok: every slot is served by a node that
+// isn't marked as failed. Otherwise keyed commands get CLUSTERDOWN.
+func (t *Topology) StateOK() bool {
+	for _, o := range t.owner {
+		if o == nil || o.Has(FlagFail) {
+			return false
+		}
+	}
+	return true
+}
+
+// AssignedSlots counts slots with an owner.
+func (t *Topology) AssignedSlots() int {
+	n := 0
+	for _, o := range t.owner {
+		if o != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// ByID finds a node.
+func (t *Topology) ByID(id string) *Node {
+	for _, n := range t.Nodes {
+		if n.ID == id {
+			return n
+		}
+	}
+	return nil
+}
 
 // Primaries in file order.
 func (t *Topology) Primaries() []*Node {
@@ -203,8 +271,8 @@ func (t *Topology) Primaries() []*Node {
 	return out
 }
 
-// SlotRanges returns every contiguous range with its owner, sorted by slot,
-// which is the shape CLUSTER SLOTS and SHARDS report.
+// SlotRanges returns every contiguous owned range with its owner, sorted
+// by slot, which is the shape CLUSTER SLOTS reports.
 func (t *Topology) SlotRanges() []OwnedRange {
 	var out []OwnedRange
 	for s := 0; s < keyslot.Count; {
@@ -212,7 +280,9 @@ func (t *Topology) SlotRanges() []OwnedRange {
 		for s < keyslot.Count && t.owner[s] == o {
 			s++
 		}
-		out = append(out, OwnedRange{Range{uint16(start), uint16(s - 1)}, o})
+		if o != nil {
+			out = append(out, OwnedRange{Range{uint16(start), uint16(s - 1)}, o})
+		}
 	}
 	return out
 }
@@ -223,7 +293,11 @@ type OwnedRange struct {
 	Owner *Node
 }
 
-// MaxEpoch is the highest config epoch (CLUSTER INFO cluster_current_epoch).
-func (t *Topology) MaxEpoch() int {
-	return slices.MaxFunc(t.Nodes, func(a, b *Node) int { return a.Epoch - b.Epoch }).Epoch
+// MaxEpoch is the highest config epoch any node has.
+func (t *Topology) MaxEpoch() uint64 {
+	var m uint64
+	for _, n := range t.Nodes {
+		m = max(m, n.Epoch)
+	}
+	return m
 }

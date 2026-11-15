@@ -32,7 +32,7 @@ type Options struct {
 	AOF     *persist.AOF      // nil = no persistence; the caller closes it after Serve returns
 	Repl    *replication.Node // nil = no replication (tests); the caller closes it
 	Faults  *faults.Registry  // nil = FAULT command disabled (the default)
-	Cluster *cluster.Topology // nil = not in cluster mode
+	Cluster *cluster.Cluster  // nil = not in cluster mode; the caller starts and closes it
 	Bus     *events.Bus       // nil = no events
 	Port    int               // our client port, for INFO
 	Hz      int               // for INFO and CONFIG GET hz
@@ -45,7 +45,7 @@ type Server struct {
 	aof      *persist.AOF
 	repl     *replication.Node
 	faults   *faults.Registry
-	topo     *cluster.Topology
+	cluster  *cluster.Cluster
 	bus      *events.Bus
 	hz       int
 	commands map[string]command
@@ -69,7 +69,7 @@ func New(opts Options) *Server {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s := &Server{
-		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, repl: opts.Repl, faults: opts.Faults, topo: opts.Cluster, bus: opts.Bus, hz: opts.Hz,
+		log: log, engine: opts.Engine, evictor: opts.Evictor, aof: opts.AOF, repl: opts.Repl, faults: opts.Faults, cluster: opts.Cluster, bus: opts.Bus, hz: opts.Hz,
 		conns: make(map[net.Conn]*client), started: time.Now(),
 	}
 	s.commands = s.commandTable()

@@ -616,3 +616,83 @@ one slot, which is why hash tags exist."
 
 2. Why does a replica answer MOVED for a GET on its own primary's key, even though it has the data?
 <details><summary>Answer</summary>Replicas are asynchronous copies and may be slightly behind, so by default Redis Cluster sends every request, reads included, to the primary for consistency. A client that accepts possibly-stale reads sends READONLY first, and then the replica serves reads for its primary's slots. Writes always go to the primary.</details>
+
+## Iteration 8: Cluster bus + gossip
+
+**What we built**
+Nodes now find each other and keep a shared picture of the cluster *by themselves*. Each node opens
+a second port (client port + 10000) for node-to-node messages (PING, PONG, MEET). Every message
+carries news about a few other nodes, so introducing nodes in a chain is enough for everyone to
+meet everyone. Clusters can be built at runtime with `CLUSTER MEET / ADDSLOTS / REPLICATE`. The
+real `redis-cli --cluster create` can build a Shardis cluster. Each node saves its own view
+(`nodes.conf`), so it survives a restart.
+
+**How it works**
+```
+          MEET            MEET            MEET
+   a ───────────► b ───────────► c ───────────► d ...
+   every PING/PONG says: "I'm b, epoch 3, I own slots 5461-10922,
+                          and I know about c (127.0.0.1:7002) and d (...)"
+   a hears about c from b → a starts a handshake with c → soon everyone knows everyone
+```
+- **Ten times a second each node:** connects to nodes it has no link to. Once a second it pings the
+  least recently heard-from of 5 random nodes, and it pings anyone silent for half the node timeout.
+- **Each message carries:** the sender's full slot ownership (a 2 KB bitmap of 16384 bits) and
+  gossip about ~10% of the cluster.
+- **Epochs settle conflicts:** if two nodes claim the same slot, the one with the higher config
+  epoch wins. If two primaries have the same epoch, the one with the smaller ID bumps its own.
+  Every node applies the same rule, so they all agree without a vote.
+- **Routing reads an immutable snapshot of the map,** and gossip swaps in a new one after each
+  change, so commands never take a lock.
+
+**Why we did it this way**
+- *Binary format with the slot bitmap in every message (ADR 024):* ownership heals itself on
+  every heartbeat. It's fuzz-tested, because the bytes come from the network.
+- *Redis's gossip schedule (ADR 025):* compared with all-to-all and with SWIM in the ADR.
+- *Copy-on-write topology + per-node `nodes.conf` (ADR 026):* lock-free routing, and a restarted
+  node keeps its identity.
+
+**What can go wrong**
+- **Traffic grows with cluster size:** 2, 5.3 and 13.4 messages per node per second at 6, 20 and
+  50 nodes. The whole cluster's traffic grows with N², because every node pings every other at
+  least every node_timeout/2.
+- **Convergence slows with size:** ~1.5 s for 6 nodes, ~11–16 s for 50 (introduced in a chain).
+- **Two bugs the tests caught:**
+  - A node whose PONG was lost was *never pinged again*, because we only ping when no ping is
+    pending. Fixed by reconnecting links whose ping has waited longer than half the timeout.
+  - Ping/pong times changed without publishing a new snapshot, so `CLUSTER NODES` showed
+    "never heard from" forever.
+- **`ADDSLOTS` only checks the local view.** Two nodes can briefly both claim a slot. Epochs settle
+  it, but someone's claim loses.
+- **No authentication on the bus.** Anyone who can reach port +10000 can MEET in. Keep it private.
+- **Nothing reacts to a dead node yet:** that's Iteration 9 (PFAIL → FAIL → failover).
+
+**Try it yourself**
+```
+make build
+for p in 7200 7201 7202 7203 7204 7205; do
+  ./bin/shardis --port $p --cluster-enabled yes --dir /tmp/sh$p & done
+redis-cli -p 7200 cluster info | grep known      # 1: it knows only itself
+for p in 7200 7201 7202 7203 7204; do redis-cli -p $p cluster meet 127.0.0.1 $((p+1)); done
+redis-cli -p 7205 cluster info | grep known      # 6, about a second later
+# or let redis-cli build it all:
+redis-cli --cluster create 127.0.0.1:7200 ... 127.0.0.1:7205 --cluster-replicas 1
+redis-cli -p 7200 cluster nodes                  # live ping/pong times, link state, epochs
+```
+
+**Interview question you can now answer**
+*"How do nodes in Redis Cluster learn about each other without a central coordinator?"*
+"Gossip. Each node keeps a connection to the others it knows, and a few times a second it pings
+someone: the least recently heard-from of a random sample, plus anyone silent for half the
+timeout. Every ping and pong includes the sender's slot ownership and news about a tenth of the
+cluster. When you hear about a node you don't know, you handshake with it. So I can introduce six
+nodes in a chain and they all know each other in about 1.5 seconds. Conflicts are settled with
+epochs: the higher config epoch wins a slot. The cost is that per-node traffic grows with cluster
+size: I measured 13 messages a second per node at 50 nodes."
+
+**Check yourself**
+1. Node a was introduced only to b. How does it end up connected to f?
+<details><summary>Answer</summary>b's PINGs and PONGs to a include gossip entries about random other nodes, each with its ID and address. When a sees an entry for a node it doesn't know, it creates it in "handshake" state and connects to its bus port. f's PONG then confirms it. Every node does this, so news spreads hop by hop until everyone knows everyone.</details>
+
+2. Two nodes both claim slot 42. How does every node agree on the owner, without a vote?
+<details><summary>Answer</summary>Every claim travels with the claimer's config epoch, and every node applies the same rule: a claim replaces the current owner only if its epoch is higher. So every node independently picks the claim with the higher epoch. If the epochs are equal, the collision rule (smaller node ID bumps its epoch) makes them different first.</details>
