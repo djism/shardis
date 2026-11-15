@@ -124,7 +124,17 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	slog.Info("shardis listening", "addr", srv.Addr().String(), "engine", engine.Name(), "hz", cfg.Hz,
 		"maxmemory", cfg.MaxMemory, "policy", policy)
 
-	err = srv.Serve(ctx) // returns once ctx is cancelled and all connections are closed
+	// On SIGTERM a cluster primary first hands its slots to its replica
+	// (ADR 043), and only then stops serving.
+	serveCtx, stopServing := context.WithCancel(context.Background())
+	go func() {
+		<-ctx.Done()
+		if err := srv.Handoff(10 * time.Second); err != nil {
+			slog.Warn("graceful handoff skipped", "err", err)
+		}
+		stopServing()
+	}()
+	err = srv.Serve(serveCtx) // returns once serving stops and all connections are closed
 	slog.Info("shardis stopped")
 	return err
 }

@@ -1,0 +1,23 @@
+# The consistency checker (shardis-chaos -external), run inside the cluster
+# while a demo script breaks things. DURATION is filled in by demos/lib.sh.
+# The "role: client" label lets the partition demo's NetworkPolicy keep
+# clients able to reach the cut-off pod, like a real partition where some
+# clients are on the minority side.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: shardis-checker
+  namespace: shardis
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: shardis, role: client}
+    spec:
+      restartPolicy: Never
+      securityContext: {runAsNonRoot: true, runAsUser: 65532}
+      containers:
+        - name: checker
+          image: shardis:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/shardis-chaos", "-external", "shardis-0.shardis.shardis.svc.cluster.local:7000", "-duration", "DURATION"]

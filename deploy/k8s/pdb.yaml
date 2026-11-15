@@ -1,0 +1,11 @@
+# Voluntary disruptions (node drains, upgrades) may take down at most one
+# pod at a time, so a primary and its replica are never both gone by choice.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: shardis
+  namespace: shardis
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: shardis, app.kubernetes.io/component: server}

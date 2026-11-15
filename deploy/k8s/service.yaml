@@ -1,0 +1,19 @@
+# Headless: no load-balancing virtual IP. Each pod gets a stable DNS name,
+# shardis-N.shardis.shardis.svc.cluster.local, which is what nodes announce
+# to each other and to clients (ADR 044). A pod's IP changes when it's
+# rescheduled; its name doesn't.
+apiVersion: v1
+kind: Service
+metadata:
+  name: shardis
+  namespace: shardis
+  labels: {app.kubernetes.io/name: shardis}
+spec:
+  clusterIP: None
+  # Publish DNS for pods that aren't ready yet: nodes must find each other
+  # while starting up (and a node in a minority is still a node).
+  publishNotReadyAddresses: true
+  selector: {app.kubernetes.io/name: shardis, app.kubernetes.io/component: server}
+  ports:
+    - {name: client, port: 7000}
+    - {name: bus, port: 17000}

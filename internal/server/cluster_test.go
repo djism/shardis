@@ -33,6 +33,7 @@ type testCluster struct {
 type clusterNode struct {
 	name, addr string
 	port       int
+	srv        *Server
 	stop       func() // like the process dying
 }
 
@@ -93,7 +94,7 @@ func startClusterWith(t *testing.T, readsWhenDown bool) *testCluster {
 		if err := cl.Start(); err != nil { // replicas start replicating from here
 			t.Fatal(err)
 		}
-		tc.nodes[n] = &clusterNode{name: n, addr: fmt.Sprintf("127.0.0.1:%d", ports[n]), port: ports[n], stop: stop}
+		tc.nodes[n] = &clusterNode{name: n, addr: fmt.Sprintf("127.0.0.1:%d", ports[n]), port: ports[n], srv: s, stop: stop}
 	}
 	for _, n := range []string{"d", "e", "f"} {
 		c := newClient(t, tc.nodes[n].addr)

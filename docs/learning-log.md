@@ -1163,3 +1163,89 @@ Jepsen mindset: don't trust the final state, check what clients actually observe
 
 2. `restart-all` kills every node with `kill -9` and loses nothing, with fsync only every second. Why isn't that proof the data is safe?
 <details><summary>Answer</summary>`kill -9` ends the process but not the OS: data already written to the file is in the kernel's page cache and reaches the disk later anyway. Only a power cut or kernel crash loses that last second. Iteration 5's simulated power loss is the test that shows it.</details>
+
+## Iteration 14: Running on Kubernetes (minikube)
+
+**What we built**
+Shardis runs as a 6-pod StatefulSet on minikube:
+- Each pod has its own volume (AOF + nodes.conf) and a stable DNS name it announces instead of
+  its IP.
+- A bootstrap Job forms the cluster with a new `shardis-admin create`.
+- When a primary gets SIGTERM, it hands its slots to its replica before exiting, so rolling
+  restarts lose nothing.
+
+Four demo scripts (crash/freeze, rolling restart, NetworkPolicy partition, scale 6→8 +
+rebalance) each run the Iteration 13 consistency checker as a Job inside the cluster.
+
+**How it works**
+```
+ StatefulSet "shardis"  (pod name = identity, forever)
+   shardis-0 ─┐   each pod: PVC /data (AOF + nodes.conf)
+   shardis-1  │   announces  shardis-N.shardis.shardis.svc.cluster.local:7000
+   …          │   headless Service: DNS for every pod, even not-ready ones
+   shardis-5 ─┘
+ Job shardis-bootstrap: shardis-admin create  → 3 primaries + 3 replicas (no-op if formed)
+
+ kubectl rollout restart  →  SIGTERM to a primary:
+   pause writes (all slot gates) → WAIT 1 → replica: CLUSTER FAILOVER TAKEOVER → exit
+   = 13 ms in the logs, 0 acknowledged writes lost
+```
+
+**Why we did it this way**
+- **Stable DNS names over pod IPs (ADR 044).** A restarted pod gets a new IP but keeps its name,
+  volume and node ID, so it rejoins as itself.
+- **A graceful handoff on SIGTERM (ADR 043)** instead of letting failure detection notice a
+  planned shutdown. TAKEOVER without a vote is safe only because the old primary has paused
+  writes and is leaving.
+- **Readiness = "accepting connections",** not "cluster healthy". Otherwise one failed shard
+  would remove every pod from DNS.
+
+**What can go wrong**
+- **Partitions still lose writes:** the NetworkPolicy demo rolled back 2,029 acknowledged
+  writes, with 130 stale reads.
+- **A NetworkPolicy doesn't cut existing connections** (Calico enforces it on new ones). Our first
+  partition did nothing until the demo also dropped the pod's connection-tracking entries.
+- **`kubectl delete pod --force` still sends SIGTERM,** so it's not a crash test. A SIGKILLed
+  container restarts in ~1 s, faster than failure detection, and keeps its role. Failovers come
+  from *stuck* nodes, which Kubernetes doesn't restart.
+- **A 2 s node timeout (a demo setting) on a struggling VM gives false alarms:** once, every node
+  briefly thought it was in the minority.
+- **After a rolling restart, primaries and replicas have swapped places.**
+- **Found by the checker:** 233 "phantom" reads were leftovers from a previous run in the
+  same long-lived cluster. Keys now have a unique prefix per run.
+
+**Try it yourself**
+```
+deploy/k8s/demos/up.sh               # minikube profile "shardis" (Calico), build, deploy, form
+deploy/k8s/demos/rolling-restart.sh  # 0 rolled back; pod logs: "graceful handoff done took=13ms"
+deploy/k8s/demos/failover.sh         # crash (restarts in ~1 s) + freeze (replica takes over)
+deploy/k8s/demos/partition.sh        # NetworkPolicy: rolled-back writes > 0
+deploy/k8s/demos/scale.sh            # 6 → 8 pods, rebalance 4096 slots under load
+deploy/k8s/demos/down.sh; minikube stop -p shardis
+```
+
+**Interview question you can now answer**
+*"Why are stateful systems hard on Kubernetes, and how did you handle it?"*
+"Kubernetes assumes pods are disposable: new IP, new pod, reschedule anywhere. A database node
+isn't disposable: it has an identity, its data, and peers that know it by address. I used a
+StatefulSet so each pod keeps its name and its own volume, and had nodes announce their DNS
+names instead of IPs, so a restarted pod rejoins as itself. Rolling restarts were the big one.
+Without help, every primary restart is a crash: seconds of unavailability and lost in-flight
+writes. So on SIGTERM my primaries pause writes, wait for the replica to catch up, hand over
+their slots, then exit. A full rolling restart under load lost zero acknowledged writes. And I
+learned some Kubernetes details the hard way: force-deleting a pod still sends SIGTERM, and a
+NetworkPolicy doesn't cut connections that are already open."
+
+**Check yourself**
+1. Why does the headless Service set `publishNotReadyAddresses: true`?
+<details><summary>Answer</summary>Nodes find each other by DNS name. A pod that isn't Ready yet (still starting, or a node in a minority) must still be resolvable, or nodes could never form or re-form the cluster: they'd wait for each other's readiness forever.</details>
+
+2. Why is `CLUSTER FAILOVER TAKEOVER` (no vote) safe in the SIGTERM handoff but dangerous in general?
+<details><summary>Answer</summary>In the handoff the old primary has already stopped accepting writes and waited until the replica has everything, and it's about to exit. There's no second writer. Used on a live primary, TAKEOVER creates two nodes that both believe they own the slots, a forced split brain, until gossip settles it and one side's writes are lost.</details>
+
+*Iteration 14 addendum:* the partition test that had been flaky since Iteration 11 was a test
+bug, and a final-state diagnostic found it. Its "is the minority refusing?" probe wrote to the
+key it later checked. Under load, the first probe landed inside the split-brain window and was
+accepted, and with no failover in that scenario, the stale probe value stayed. The probe uses
+its own key now. This was the second time (after Iteration 10's reads-when-down test) that a
+probe write corrupted the thing being measured.

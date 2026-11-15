@@ -1,0 +1,67 @@
+# Six Shardis nodes. A StatefulSet (not a Deployment) because each node is a
+# distinct member with its own identity and data: shardis-3 is always
+# shardis-3, with the same DNS name, node ID (nodes.conf) and AOF on its
+# own PersistentVolume, wherever it's rescheduled (ADR 044).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: shardis
+  namespace: shardis
+  labels: {app.kubernetes.io/name: shardis}
+spec:
+  serviceName: shardis
+  replicas: 6
+  # Start (and replace) pods all at once; the bootstrap Job forms the
+  # cluster once they all answer. Rolling updates still go one pod at a time.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app.kubernetes.io/name: shardis, app.kubernetes.io/component: server}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: shardis, app.kubernetes.io/component: server}
+    spec:
+      # SIGTERM → a primary hands its slots to its replica, then exits
+      # (ADR 043). That takes milliseconds; 30 s is plenty of slack.
+      terminationGracePeriodSeconds: 30
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532}
+      containers:
+        - name: shardis
+          image: shardis:dev
+          imagePullPolicy: IfNotPresent
+          envFrom: [{configMapRef: {name: shardis-config}}]
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            # Announce the stable DNS name, not the pod IP (ADR 044).
+            - name: SHARDIS_CLUSTER_ANNOUNCE_ADDR
+              value: "$(POD_NAME).shardis.$(POD_NAMESPACE).svc.cluster.local:7000"
+          ports:
+            - {name: client, containerPort: 7000}
+            - {name: bus, containerPort: 17000}
+          # Ready = accepting connections (the AOF has been replayed by then).
+          # Not "cluster_state:ok": that would pull every pod out of DNS the
+          # moment one shard fails, and they'd never find each other again.
+          readinessProbe:
+            tcpSocket: {port: client}
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: {port: client}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 256Mi}}

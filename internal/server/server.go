@@ -57,6 +57,7 @@ type Server struct {
 
 	gates        *slotGates // per-slot migration gates (ADR 033)
 	migrateConns migrateConns
+	writesPaused atomic.Bool // graceful handoff in progress (ADR 043)
 
 	ln net.Listener
 

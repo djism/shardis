@@ -1,0 +1,8 @@
+# kubectl apply -k deploy/k8s
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - service.yaml
+  - statefulset.yaml
+  - pdb.yaml
+  - bootstrap-job.yaml

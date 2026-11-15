@@ -207,7 +207,8 @@ func PrintNodes(addr string, w io.Writer) error {
 
 // AddNode introduces a new (empty) node to the cluster: the new node MEETs
 // an existing one, and gossip introduces it to everyone else. It returns
-// once every node knows the newcomer, with the newcomer's ID.
+// once every node knows the newcomer, with the newcomer's ID. replicaOf may
+// be a primary's node ID or its address (host:port).
 func AddNode(existing, newAddr, replicaOf string) (string, error) {
 	if newAddr == "" {
 		return "", fmt.Errorf("-new is required")
@@ -215,6 +216,12 @@ func AddNode(existing, newAddr, replicaOf string) (string, error) {
 	host, port, err := net.SplitHostPort(existing)
 	if err != nil {
 		return "", err
+	}
+	newHost, _, _ := net.SplitHostPort(newAddr)
+	if isLoopback(host) && !isLoopback(newHost) {
+		// The new node is told to MEET this address. From its side,
+		// localhost is itself.
+		return "", fmt.Errorf("-addr %s is a loopback address, but the new node (%s) must be able to reach it: use the node's real name or IP", existing, newAddr)
 	}
 	c, err := dial(newAddr)
 	if err != nil {
@@ -241,6 +248,18 @@ func AddNode(existing, newAddr, replicaOf string) (string, error) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if replicaOf != "" {
+		if strings.Contains(replicaOf, ":") { // an address: look up its node ID
+			pc, err := dial(replicaOf)
+			if err != nil {
+				return "", err
+			}
+			v, err := pc.do("CLUSTER", "MYID")
+			pc.close()
+			if err != nil {
+				return "", err
+			}
+			replicaOf = string(v.Str)
+		}
 		if _, err := c.do("CLUSTER", "REPLICATE", replicaOf); err != nil {
 			return "", err
 		}
@@ -332,4 +351,12 @@ func RemoveNode(addr, id string) error {
 		}
 	}
 	return nil
+}
+
+func isLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

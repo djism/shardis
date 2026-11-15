@@ -6,6 +6,7 @@
 //	shardis-chaos                                   # every scenario
 //	shardis-chaos -scenarios kill-primary,slow-node
 //	shardis-chaos -list
+//	shardis-chaos -external shardis-0.shardis:7000 -duration 90s   # checker only (Kubernetes demos)
 //
 // We don't claim linearizability: Redis Cluster doesn't promise it. We
 // measure what does hold, and how often what doesn't fails.
@@ -33,7 +34,18 @@ func main() {
 	traces := flag.String("traces", "website/public/traces", "where to write trace JSON")
 	csvPath := flag.String("csv", "docs/benchmarks/iter-13-chaos/report.csv", "report CSV ('' = none)")
 	list := flag.Bool("list", false, "list scenarios and exit")
+	external := flag.String("external", "", "checker-only mode: run the workload against this existing cluster (no faults; something else injects them)")
+	duration := flag.Duration("duration", 60*time.Second, "external mode: how long to run the workload")
 	flag.Parse()
+	if *external != "" {
+		r, err := runExternal(*external, *duration)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "shardis-chaos:", err)
+			os.Exit(1)
+		}
+		printTable(os.Stdout, []report{r})
+		return
+	}
 	if *list {
 		for _, s := range scenarios {
 			fmt.Printf("%-28s %s\n", s.name, s.desc)
@@ -181,4 +193,55 @@ func writeTrace(path string, s scenario, h *harness, rec *recorder, hist *histor
 		return err
 	}
 	return os.WriteFile(path, b, 0o644)
+}
+
+// runExternal runs the recorded workload against a cluster someone else is
+// breaking (the Kubernetes demo scripts: kubectl delete pod, rollout
+// restart, NetworkPolicy), then checks the history. No traces: the nodes
+// come and go, and the demo prints its own timeline.
+func runExternal(addr string, d time.Duration) (report, error) {
+	var cl *client.Cluster
+	var err error
+	for range 60 { // the cluster may still be forming
+		if cl, err = client.NewCluster([]string{addr}, client.Options{MaxRetryTime: 60 * time.Second}); err == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		return report{}, err
+	}
+	defer cl.Close()
+	hist := &history{t0: time.Now()}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() { runWorkload(cl, hist, stop); close(done) }()
+	tick := time.NewTicker(5 * time.Second)
+	end := time.After(d)
+loop:
+	for {
+		select {
+		case <-end:
+			break loop
+		case <-tick.C:
+			fmt.Fprintf(os.Stderr, "%4.0fs  moved=%d ask=%d retries=%d net_errors=%d\n", time.Since(hist.t0).Seconds(),
+				cl.Stats.Moved.Load(), cl.Stats.Ask.Load(), cl.Stats.Retries.Load(), cl.Stats.NetErrors.Load())
+		}
+	}
+	close(stop)
+	<-done
+	elapsed := time.Since(hist.t0)
+	final := make([]int64, writers*keysPerWriter)
+	for k := range final {
+		v, err := cl.Do(context.Background(), []byte("GET"), keyName(k))
+		if err != nil {
+			return report{}, fmt.Errorf("final read of key %d: %w", k, err)
+		}
+		final[k], _ = strconv.ParseInt(string(v.Str), 10, 64)
+	}
+	r := check(hist, final, elapsed)
+	r.Scenario = "external " + addr
+	fmt.Fprintf(os.Stderr, "longest stall: %.0f ms, ending %.1f s after start (%s)\n", r.MaxStallMs, r.MaxStallAtS,
+		hist.t0.Add(time.Duration(r.MaxStallAtS*float64(time.Second))).UTC().Format("15:04:05.000"))
+	return r, nil
 }

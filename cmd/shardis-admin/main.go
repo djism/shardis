@@ -3,6 +3,7 @@
 // resharding, ADR 032). The logic lives in internal/admin, which the crash
 // tool and tests use too.
 //
+//	shardis-admin create      -nodes h1:7000,h2:7000,...,h6:7000 -replicas 1   (form a new cluster; no-op if formed)
 //	shardis-admin add-node    -addr 127.0.0.1:7000 -new 127.0.0.1:7006 [-replica-of <primary-id>]
 //	shardis-admin reshard     -addr 127.0.0.1:7000 -from <id> -to <id> -slots 1000
 //	shardis-admin rebalance   -addr 127.0.0.1:7000      (even out slots, including empty primaries)
@@ -17,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/djism/shardis/internal/admin"
@@ -34,16 +36,20 @@ func main() {
 	fs.IntVar(&o.TimeoutMs, "migrate-timeout", 10000, "MIGRATE timeout (ms)")
 	fs.BoolVar(&o.Verbose, "v", false, "print every slot moved")
 	newNode := fs.String("new", "", "add-node: the new node's address")
-	replicaOf := fs.String("replica-of", "", "add-node: make the new node a replica of this primary ID")
+	replicaOf := fs.String("replica-of", "", "add-node: make the new node a replica of this primary (node ID or host:port)")
 	from := fs.String("from", "", "reshard: source primary ID")
 	to := fs.String("to", "", "reshard: target primary ID")
 	slots := fs.Int("slots", 0, "reshard: how many slots to move")
 	id := fs.String("id", "", "remove-node: the node to remove")
+	nodes := fs.String("nodes", "", "create: comma-separated node addresses (primaries first)")
+	replicas := fs.Int("replicas", 1, "create: replicas per primary")
 	fs.Parse(args)
 
 	start := time.Now()
 	var err error
 	switch cmd {
+	case "create":
+		err = admin.Create(strings.Split(*nodes, ","), *replicas, func(f string, a ...any) { fmt.Printf(f, a...) })
 	case "add-node":
 		var newID string
 		if newID, err = admin.AddNode(*addr, *newNode, *replicaOf); err == nil {
@@ -74,6 +80,6 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: shardis-admin add-node|reshard|rebalance|remove-node|fix|nodes [flags]  (-h for flags)")
+	fmt.Fprintln(os.Stderr, "usage: shardis-admin create|add-node|reshard|rebalance|remove-node|fix|nodes [flags]  (-h for flags)")
 	os.Exit(2)
 }

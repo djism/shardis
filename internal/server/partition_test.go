@@ -166,7 +166,11 @@ func TestPartitionPrimaryWithItsReplica(t *testing.T) {
 	eventually(t, "majority marks a FAIL and goes down", func() bool {
 		return clusterInfoField(t, b, "cluster_state") == "fail"
 	})
-	eventually(t, "minority a refuses too", func() bool { return strings.HasPrefix(a.do("SET", ka, "x"), "CLUSTERDOWN") })
+	// Probe with a different key: the first probe may be accepted before a
+	// notices it's in the minority (the split-brain window, ADR 030), and
+	// with no failover in this scenario a keeps that value. Probing ka
+	// itself made the final check flaky under load.
+	eventually(t, "minority a refuses too", func() bool { return strings.HasPrefix(a.do("SET", ka+"-probe", "x"), "CLUSTERDOWN") })
 	time.Sleep(3 * time.Second) // no failover may happen: d can't win votes from the majority
 	if got := b.do("SET", tc.keyIn("b"), "x"); !strings.HasPrefix(got, "CLUSTERDOWN") {
 		t.Fatalf("majority with a failed shard (full coverage) = %q", got)
@@ -175,9 +179,19 @@ func TestPartitionPrimaryWithItsReplica(t *testing.T) {
 		t.Fatalf("d was promoted without a majority: %s", role)
 	}
 	tc.all(t, "", "FAULT", "HEAL")
-	eventuallyWithin(t, healWait, "everything back, a still primary", func() bool {
-		return clusterInfoField(t, b, "cluster_state") == "ok" && a.do("GET", ka) == `"v"` && strings.HasPrefix(a.do("ROLE"), `["master"`)
-	})
+	deadline := time.Now().Add(healWait)
+	for {
+		state, got, role := clusterInfoField(t, b, "cluster_state"), a.do("GET", ka), a.do("ROLE")
+		if state == "ok" && got == `"v"` && strings.HasPrefix(role, `["master"`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			// Say exactly what was still wrong: this test has been the flaky one.
+			t.Logf("b: cluster_state=%s\nb's view:\n%s\na's view:\n%s", state, b.do("CLUSTER", "NODES"), a.do("CLUSTER", "NODES"))
+			t.Fatalf("not back after %v: GET on a = %s, a ROLE = %.30s", healWait, got, role)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // Scenario C: a lone replica is cut off. Nothing fails over; it refuses to

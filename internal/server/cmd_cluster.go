@@ -155,6 +155,14 @@ func cmdCluster(cl *client, args [][]byte) {
 			return
 		}
 		replyOK(cl, c.SetConfigEpoch(e))
+	case sub == "FAILOVER" && len(args) <= 3:
+		// Only TAKEOVER (the graceful-shutdown handoff, ADR 043). A
+		// coordinated manual failover with votes isn't implemented.
+		if len(args) != 3 || !strings.EqualFold(string(args[2]), "TAKEOVER") {
+			cl.w.WriteError("ERR only CLUSTER FAILOVER TAKEOVER is supported")
+			return
+		}
+		replyOK(cl, c.TakeOver())
 	case sub == "SETSLOT" && len(args) >= 4:
 		clusterSetSlot(cl, args)
 	case sub == "KEYSLOT" && len(args) == 3:

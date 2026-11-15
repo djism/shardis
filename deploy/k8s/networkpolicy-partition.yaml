@@ -1,0 +1,20 @@
+# Used by demos/partition.sh (POD is filled in). Cuts one Shardis pod off
+# from the other Shardis pods, both directions, cluster bus and replication
+# alike, while pods labelled role=client (the checker) can still reach it,
+# and it can still resolve DNS. Needs a CNI that enforces NetworkPolicy
+# (minikube --cni=calico).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: isolate-one-node
+  namespace: shardis
+spec:
+  podSelector:
+    matchLabels: {statefulset.kubernetes.io/pod-name: POD}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {role: client}}}]
+  egress:
+    - to: [{podSelector: {matchLabels: {role: client}}}]
+    - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]

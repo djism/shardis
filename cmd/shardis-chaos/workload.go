@@ -56,7 +56,12 @@ type history struct {
 	errMu  sync.Mutex
 }
 
-func keyName(k int) []byte { return []byte(fmt.Sprint("chaos:", k)) }
+// keyPrefix is unique per run, so a run never reads values a previous run
+// left in a long-lived cluster (external mode). Without it, the checker
+// reported "phantom" reads on Kubernetes: leftovers from the last run.
+var keyPrefix = fmt.Sprintf("chaos:%d:", time.Now().UnixNano()%1e9)
+
+func keyName(k int) []byte { return []byte(fmt.Sprint(keyPrefix, k)) }
 
 func (h *history) noteErr(err error, v resp.Value) {
 	h.errMu.Lock()
@@ -142,6 +147,7 @@ type report struct {
 	Reads         int      `json:"reads"`
 	Phantoms      int      `json:"phantom_reads"`
 	MaxStallMs    float64  `json:"max_stall_ms"`
+	MaxStallAtS   float64  `json:"max_stall_at_s"` // when the longest stall ended (s since start)
 	P99Ms         float64  `json:"p99_ms"`
 	MaxLatencyMs  float64  `json:"max_latency_ms"`
 	Events        int      `json:"events"`
@@ -206,7 +212,9 @@ func check(h *history, final []int64, end time.Duration) report {
 		slices.Sort(acks)
 		prev := time.Duration(0)
 		for _, a := range append(acks, end) {
-			r.MaxStallMs = max(r.MaxStallMs, float64(a-prev)/1e6)
+			if gap := float64(a-prev) / 1e6; gap > r.MaxStallMs {
+				r.MaxStallMs, r.MaxStallAtS = gap, a.Seconds()
+			}
 			prev = a
 		}
 	}

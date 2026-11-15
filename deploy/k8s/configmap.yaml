@@ -1,0 +1,19 @@
+# Settings shared by every pod. The binary reads SHARDIS_* env vars (ADR 001),
+# so the same image runs locally, in Compose and here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shardis-config
+  namespace: shardis
+data:
+  SHARDIS_HOST: "0.0.0.0"
+  SHARDIS_PORT: "7000"
+  SHARDIS_DIR: /data
+  SHARDIS_CLUSTER_ENABLED: "yes"             # formed by the bootstrap Job (shardis-admin create)
+  # 2 s so a crashed pod is replaced by its replica before Kubernetes restarts
+  # it (~5 s here): a demo setting. Production would use 5-15 s (ADR 027).
+  SHARDIS_CLUSTER_NODE_TIMEOUT: "2000"
+  SHARDIS_APPENDONLY: "yes"                  # AOF on the pod's PersistentVolume
+  SHARDIS_APPENDFSYNC: everysec
+  SHARDIS_MAXMEMORY: 200mb
+  SHARDIS_MAXMEMORY_POLICY: allkeys-lru      # it's a cache

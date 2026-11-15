@@ -166,6 +166,10 @@ func (s *Server) dispatch(cl *client, args [][]byte) {
 		cl.w.WriteError("READONLY You can't write against a read only replica.")
 		return
 	}
+	if cmd.flags&flagWrite != 0 && s.writesPaused.Load() {
+		cl.w.WriteError(errHandingOff) // checked under the slot gate: see pauseWrites
+		return
+	}
 	if cmd.flags&flagWrite != 0 && s.aof != nil {
 		// Once the AOF has failed (disk full, I/O error), refuse writes:
 		// we couldn't make them durable. Like Redis's MISCONF error.

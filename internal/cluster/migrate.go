@@ -176,3 +176,48 @@ func (c *Cluster) dropStaleMarkers() {
 		}
 	}
 }
+
+// TakeOver is CLUSTER FAILOVER TAKEOVER: this replica becomes the primary
+// of its primary's slots right now, with no election. It bumps its config
+// epoch without consensus (ADR 035) and claims the slots; gossip carries the
+// higher epoch to everyone, and the old primary demotes itself on seeing it.
+//
+// It's only safe when the old primary has stopped accepting writes and
+// this replica has everything it acknowledged, which is exactly the
+// graceful-shutdown handoff (ADR 043). Used blindly it's a forced split
+// brain, which is why Redis documents TAKEOVER as a last resort.
+func (c *Cluster) TakeOver() error {
+	c.mu.Lock()
+	me := c.myself
+	old := c.nodes[me.primaryID]
+	if me.flags&FlagReplica == 0 || old == nil {
+		c.mu.Unlock()
+		return errors.New("You should send CLUSTER FAILOVER to a replica")
+	}
+	me.flags = me.flags&^FlagReplica | FlagPrimary
+	me.primaryID = ""
+	c.bumpEpochWithoutConsensus()
+	taken := 0
+	for s, o := range c.owner {
+		if o == old {
+			c.owner[s] = me
+			taken++
+		}
+	}
+	c.election = election{}
+	c.dirty = true
+	c.publish()
+	ev := map[string]any{"node": me.label(), "epoch": me.configEpoch, "slots": taken, "old_primary": old.label()}
+	for _, n := range c.nodes { // announce now, not at the next heartbeat
+		if n != me && n.link != nil {
+			n.link.send(c.buildMessage(msgPong, n))
+		}
+	}
+	c.mu.Unlock()
+	c.log.Warn("took over my primary's slots (CLUSTER FAILOVER TAKEOVER)", "epoch", ev["epoch"], "slots", taken)
+	c.emit("failover_takeover", ev)
+	if c.opts.Replicator != nil {
+		c.opts.Replicator.Promote()
+	}
+	return nil
+}

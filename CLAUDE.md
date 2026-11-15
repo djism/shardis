@@ -140,7 +140,8 @@ pkg/client/           our smart cluster client: slot map, MOVED/ASK, COMMAND key
                       budget + jittered backoff, RetrySafe/All/Never, per-node pools, replica reads
 deploy/local/         6-node cluster as local processes (cluster.sh, topology.conf)
 deploy/compose/       docker-compose 6-node cluster (Dockerfile at repo root)
-deploy/k8s/           Kubernetes manifests (StatefulSet etc.)
+deploy/k8s/           StatefulSet, headless Service, ConfigMap, PDB, bootstrap + checker Jobs, NetworkPolicy
+deploy/k8s/demos/     up.sh, failover.sh, rolling-restart.sh, partition.sh, scale.sh, down.sh
 website/              showcase site (React + Vite + TypeScript)
 docs/decisions/       design decision records
 docs/benchmarks/      benchmark results (raw + summary)
@@ -207,6 +208,11 @@ steps (e.g. always 114,220 req/s) and is slower than the single-threaded client.
 make cluster-up-local    # 6 local processes on 127.0.0.1:7000-7005 (deploy/local/topology.conf)
 make cluster-down-local
 make cluster-up          # 6 containers with docker compose (deploy/compose), same ports
+deploy/k8s/demos/up.sh   # minikube profile "shardis" (Calico), build image, deploy, form cluster
+deploy/k8s/demos/failover.sh | rolling-restart.sh | partition.sh | scale.sh   # each runs the checker Job
+deploy/k8s/demos/down.sh # delete the namespace (minikube stop -p shardis to stop the VM)
+bin/shardis-admin create -nodes h1:7000,...,h6:7000 -replicas 1   # form a cluster (no-op if formed)
+bin/shardis-chaos -external host:7000 -duration 60s  # checker only, against a cluster something else breaks
 make cluster-down
 redis-cli -c -p 7000     # -c follows MOVED; use timeouts in scripts (AirPlay owns *:7000)
 SHARDIS_ENABLE_FAULT_INJECTION=yes make cluster-up-local   # SHARDIS_* env reaches every node
