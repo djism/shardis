@@ -4,7 +4,7 @@ PKG     := ./...
 GOFILES := $(shell find . -name '*.go' -not -path './website/*')
 
 .DEFAULT_GOAL := help
-.PHONY: help build chaos test test-memory fuzz bench run fmt vet lint clean cluster-up cluster-down cluster-up-local cluster-down-local
+.PHONY: help build chaos web-dev web-test web-build test test-memory fuzz bench run fmt vet lint clean cluster-up cluster-down cluster-up-local cluster-down-local
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -16,6 +16,15 @@ build: ## build binaries into bin/
 	go build -o bin/shardis-admin ./cmd/shardis-admin
 	go build -o bin/shardis-chaos ./cmd/shardis-chaos
 	go build -o bin/shardis-observer ./cmd/shardis-observer
+
+web-dev: ## website dev server (http://127.0.0.1:5174), live mode talks to bin/shardis-observer
+	cd website && npm install --no-audit --no-fund && npx vite --host 127.0.0.1 --port 5174
+
+web-test: ## website: typecheck + unit tests (incl. CRC16 vectors shared with the Go server)
+	cd website && npm ci --no-audit --no-fund && npm run decisions && npx tsc -p . && npx vitest run
+
+web-build: web-test ## website: production build into website/dist
+	cd website && npm run build
 
 chaos: build ## run every chaos scenario: report table + traces in website/public/traces (~5 min)
 	bin/shardis-chaos

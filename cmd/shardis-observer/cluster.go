@@ -25,6 +25,7 @@ type Node struct {
 	Epoch   int64    `json:"epoch"`
 	Up      bool     `json:"up"` // the observer reached it in the last round
 	Keys    int64    `json:"keys"`
+	Ops     float64  `json:"ops"` // commands per second since the last snapshot (from INFO)
 }
 
 // observer keeps the current topology and follows every node's events.
@@ -36,6 +37,12 @@ type observer struct {
 	nodes  []Node
 	follow map[string]bool // addrs we already stream events from
 	stop   chan struct{}
+	prev   map[string]opsSample // addr → last total_commands_processed
+}
+
+type opsSample struct {
+	total int64
+	at    time.Time
 }
 
 // loadNames reads a seed topology file (deploy/local/topology.conf) for
@@ -98,6 +105,9 @@ func (o *observer) refresh() {
 	for i := range nodes {
 		if v, err := command(nodes[i].Addr, "DBSIZE"); err == nil {
 			nodes[i].Keys, nodes[i].Up = v.Int, true
+		}
+		if v, err := command(nodes[i].Addr, "INFO", "stats"); err == nil {
+			nodes[i].Ops = o.opsRate(nodes[i].Addr, string(v.Str))
 		}
 		o.mu.Lock()
 		if !o.follow[nodes[i].Addr] {
@@ -242,3 +252,24 @@ func command(addr string, args ...string) (resp.Value, error) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// opsRate turns INFO's total_commands_processed into commands per second
+// since the previous snapshot. Our own DBSIZE/INFO polls are 2 commands a
+// second; small enough to ignore.
+func (o *observer) opsRate(addr, info string) float64 {
+	var total int64
+	for _, line := range strings.Split(info, "\r\n") {
+		if v, ok := strings.CutPrefix(line, "total_commands_processed:"); ok {
+			total, _ = strconv.ParseInt(v, 10, 64)
+		}
+	}
+	now := time.Now()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	p, seen := o.prev[addr]
+	o.prev[addr] = opsSample{total, now}
+	if !seen || total < p.total {
+		return 0 // first sample, or the node restarted
+	}
+	return float64(total-p.total) / now.Sub(p.at).Seconds()
+}

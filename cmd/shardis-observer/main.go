@@ -53,7 +53,8 @@ func main() {
 }
 
 func newObserver(seeds []string, names map[string]string) *observer {
-	return &observer{seeds: seeds, names: names, hub: newHub(), follow: map[string]bool{}, stop: make(chan struct{})}
+	return &observer{seeds: seeds, names: names, hub: newHub(), follow: map[string]bool{}, stop: make(chan struct{}),
+		prev: map[string]opsSample{}}
 }
 
 func handler(o *observer, a *actions) http.Handler {
