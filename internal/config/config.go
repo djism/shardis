@@ -62,6 +62,9 @@ type Config struct {
 	ClusterAnnounceAddr     string // host:port clients are told; default: from seed, else listen addr
 	ClusterAnnounceInternal string // host:port other nodes use; default: from seed, else = announce addr
 	ClusterNodeTimeoutMs    int
+	// ClusterFullCoverage: refuse every keyed command while any slot is
+	// unserved or failed (Redis's cluster-require-full-coverage, default yes).
+	ClusterFullCoverage bool
 }
 
 // Load builds a Config from args (usually os.Args[1:]) and getenv (usually os.Getenv).
@@ -114,6 +117,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if err := integer(fs, getenv, &cfg.ClusterNodeTimeoutMs, "cluster-node-timeout", 15000, "ms without a reply before a node is suspected down"); err != nil {
 		return Config{}, err
 	}
+	var fullCoverage string
+	str(fs, getenv, &fullCoverage, "cluster-require-full-coverage", "yes", "refuse all keyed commands while any slot is down (no = only those slots)")
 	str(fs, getenv, &cfg.ClusterNode, "cluster-node", "", "this node's name in the cluster topology file")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -142,6 +147,9 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.ClusterEnabled, err = yesNo("cluster-enabled", clusterOn); err != nil {
+		return Config{}, err
+	}
+	if cfg.ClusterFullCoverage, err = yesNo("cluster-require-full-coverage", fullCoverage); err != nil {
 		return Config{}, err
 	}
 	if (cfg.ClusterConfig == "") != (cfg.ClusterNode == "") {

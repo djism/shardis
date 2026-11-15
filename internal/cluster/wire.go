@@ -14,15 +14,16 @@ import (
 //	offset  size  field
 //	0       4     magic "SBUS"
 //	4       1     version (1)
-//	5       1     type (PING, PONG, MEET, FAIL, UPDATE)
+//	5       1     type (PING, PONG, MEET, FAIL, UPDATE, AUTH_REQUEST, AUTH_ACK)
 //	6       4     total length, including these 10 bytes
 //	10      40    sender node ID (hex)
 //	50      8     sender's current epoch
 //	58      8     sender's config epoch
 //	66      2     sender flags (primary / replica)
-//	68      40    sender's primary ID (zeros if it is a primary)
-//	108     2     sender's bus port
-//	110     ...   sender client address, then internal address (1-byte length + bytes)
+//	68      8     sender's replication offset (replicas rank themselves by it)
+//	76      40    sender's primary ID (zeros if it is a primary)
+//	116     2     sender's bus port
+//	118     ...   sender client address, then internal address (1-byte length + bytes)
 //	...     2048  slots the sender serves: one bit per slot (16384 bits)
 //	...     2     number of gossip entries, then each entry:
 //	              40 ID | 2 flags | 2 bus port | 4 ms since ping sent | 4 ms since pong
@@ -45,11 +46,14 @@ const (
 	msgPing uint8 = iota
 	msgPong
 	msgMeet
-	msgFail   // Iteration 9
-	msgUpdate // Iteration 9-10
+	msgFail    // "this node is FAIL": one gossip entry names it
+	msgUpdate  // reserved
+	msgAuthReq // a replica asks primaries for their vote (failover)
+	msgAuthAck // a primary grants its vote
+	numMsgTypes
 )
 
-var msgNames = [...]string{"ping", "pong", "meet", "fail", "update"}
+var msgNames = [numMsgTypes]string{"ping", "pong", "meet", "fail", "update", "auth_request", "auth_ack"}
 
 // Wire flags (a subset of the node flags; see cluster.go).
 const (
@@ -65,6 +69,7 @@ type message struct {
 	currentEpoch uint64
 	configEpoch  uint64
 	flags        uint16
+	offset       uint64 // sender's replication offset
 	primaryID    string // "" if the sender is a primary
 	busPort      uint16
 	clientAddr   string
@@ -108,6 +113,7 @@ func (m *message) encode() []byte {
 	b = binary.BigEndian.AppendUint64(b, m.currentEpoch)
 	b = binary.BigEndian.AppendUint64(b, m.configEpoch)
 	b = binary.BigEndian.AppendUint16(b, m.flags)
+	b = binary.BigEndian.AppendUint64(b, m.offset)
 	b = putID(b, m.primaryID)
 	b = binary.BigEndian.AppendUint16(b, m.busPort)
 	b = putStr(b, m.clientAddr)
@@ -159,6 +165,7 @@ func decodeBody(typ uint8, b []byte) (*message, error) {
 	m.currentEpoch = d.u64()
 	m.configEpoch = d.u64()
 	m.flags = d.u16()
+	m.offset = d.u64()
 	m.primaryID = d.id()
 	m.busPort = d.u16()
 	m.clientAddr = d.str()
@@ -181,7 +188,7 @@ func decodeBody(typ uint8, b []byte) (*message, error) {
 	if d.err != nil {
 		return nil, d.err
 	}
-	if typ > msgUpdate || m.sender == "" {
+	if typ >= numMsgTypes || m.sender == "" {
 		return nil, fmt.Errorf("%w: type %d / empty sender", errBadMessage, typ)
 	}
 	return m, nil

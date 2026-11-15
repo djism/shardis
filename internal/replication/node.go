@@ -264,3 +264,25 @@ func (n *Node) Info() Info {
 	}
 	return in
 }
+
+// Offset is this node's replication offset: on a primary, everything it has
+// streamed; on a replica, everything it has received. Replicas compare
+// offsets to decide which of them is most up to date (failover ranking).
+func (n *Node) Offset() int64 {
+	_, end := n.backlog.offsets()
+	return end
+}
+
+// LinkDownFor is how long a replica has been cut off from its primary
+// (0 while the link is up, or on a primary). A replica cut off for too long
+// has stale data and must not win a failover (ADR 029).
+func (n *Node) LinkDownFor() time.Duration {
+	if n.Role() != RoleReplica || n.linkStatus.Load().(string) == "up" {
+		return 0
+	}
+	last := n.lastIO.Load()
+	if last == 0 {
+		return time.Duration(1 << 62) // never synced: infinitely stale
+	}
+	return time.Since(time.Unix(0, last))
+}

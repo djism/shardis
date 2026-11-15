@@ -184,9 +184,10 @@ func openCluster(cfg config.Config, repl *replication.Node, reg *faults.Registry
 	}
 	cl, err := cluster.New(cluster.Options{
 		ClientAddr: clientAddr, InternalAddr: internalAddr, Seed: seed,
-		StateFile:   filepath.Join(cfg.Dir, "nodes.conf"),
-		NodeTimeout: time.Duration(cfg.ClusterNodeTimeoutMs) * time.Millisecond,
-		Replicator:  repl, Faults: reg, Bus: bus, Log: slog.Default(),
+		StateFile:            filepath.Join(cfg.Dir, "nodes.conf"),
+		AllowPartialCoverage: !cfg.ClusterFullCoverage,
+		NodeTimeout:          time.Duration(cfg.ClusterNodeTimeoutMs) * time.Millisecond,
+		Replicator:           repl, Faults: reg, Bus: bus, Log: slog.Default(),
 	})
 	if err != nil {
 		return nil, err

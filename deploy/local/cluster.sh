@@ -14,22 +14,31 @@ nodes=(a b c d e f)
 # (e.g. before our node has bound 127.0.0.1:7000) hangs forever.
 rcli() { perl -e 'alarm shift; exec @ARGV' 2 redis-cli "$@"; }
 
+start_node() { # index
+  local i=$1 n=${nodes[$1]} port=$((7000 + $1))
+  if [ -f "$RUN/$n.pid" ] && kill -0 "$(cat "$RUN/$n.pid")" 2>/dev/null; then
+    echo "node $n already running"; return
+  fi
+  mkdir -p "$RUN/$n"
+  ./bin/shardis --port "$port" --cluster-config "$TOPO" --cluster-node "$n" \
+    --appendonly "${APPENDONLY:-yes}" --dir "$RUN/$n" >>"$RUN/$n.log" 2>&1 &
+  echo $! >"$RUN/$n.pid"
+}
+
+wait_node() { # index
+  for _ in $(seq 50); do [ "$(rcli -p $((7000 + $1)) ping 2>/dev/null)" = PONG ] && return; sleep 0.1; done
+}
+
 up() {
   make build >/dev/null
   mkdir -p "$RUN"
-  for i in "${!nodes[@]}"; do
-    n=${nodes[$i]} port=$((7000 + i))
-    if [ -f "$RUN/$n.pid" ] && kill -0 "$(cat "$RUN/$n.pid")" 2>/dev/null; then
-      echo "node $n already running"; continue
-    fi
-    mkdir -p "$RUN/$n"
-    ./bin/shardis --port "$port" --cluster-config "$TOPO" --cluster-node "$n" \
-      --appendonly "${APPENDONLY:-yes}" --dir "$RUN/$n" >"$RUN/$n.log" 2>&1 &
-    echo $! >"$RUN/$n.pid"
-  done
-  for i in "${!nodes[@]}"; do # wait until every node answers
-    for _ in $(seq 50); do [ "$(rcli -p $((7000 + i)) ping 2>/dev/null)" = PONG ] && break; sleep 0.1; done
-  done
+  # Primaries first, replicas once the primaries answer. Started together, a
+  # replica can dial 127.0.0.1:7000 before node a has bound it and reach
+  # macOS's AirPlay Receiver instead (it listens on *:7000 and never replies).
+  for i in 0 1 2; do start_node "$i"; done
+  for i in 0 1 2; do wait_node "$i"; done
+  for i in 3 4 5; do start_node "$i"; done
+  for i in 3 4 5; do wait_node "$i"; done
   status
 }
 

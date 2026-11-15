@@ -37,19 +37,21 @@ import (
 
 // Node is one member of the cluster, as of one snapshot.
 type Node struct {
-	Name     string // from the seed file; "" for nodes met at runtime
-	ID       string // 40 hex chars
-	Addr     string // client-facing host:port
-	Internal string // node-to-node host:port (replication)
-	BusPort  int    // cluster bus port on the Internal host
-	Primary  *Node  // nil for primaries
-	Slots    []Range
-	Replicas []*Node
-	Epoch    uint64 // config epoch: the version of this node's slot claims
-	Flags    uint16 // Flag* bits
-	PingSent time.Time
-	PongRecv time.Time
-	LinkUp   bool // we have a working outbound bus connection to it
+	Name        string // from the seed file; "" for nodes met at runtime
+	ID          string // 40 hex chars
+	Addr        string // client-facing host:port
+	Internal    string // node-to-node host:port (replication)
+	BusPort     int    // cluster bus port on the Internal host
+	Primary     *Node  // nil for primaries
+	Slots       []Range
+	Replicas    []*Node
+	Epoch       uint64 // config epoch: the version of this node's slot claims
+	Flags       uint16 // Flag* bits
+	PingSent    time.Time
+	PongRecv    time.Time
+	LinkUp      bool  // we have a working outbound bus connection to it
+	ReplOffset  int64 // its replication offset, as last advertised
+	FailReports int   // primaries currently reporting it unreachable
 }
 
 // Node flags.
@@ -89,6 +91,45 @@ type Topology struct {
 	Me           *Node
 	CurrentEpoch uint64
 	owner        [keyslot.Count]*Node // slot → primary that serves it (nil = nobody)
+
+	// Computed once per snapshot, so per-command checks are O(1).
+	stateOK       bool
+	fullCoverage  bool
+	pfailSlots    int
+	failSlots     int
+	assignedSlots int
+}
+
+func (t *Topology) computeState(fullCoverage bool) {
+	t.fullCoverage = fullCoverage
+	t.stateOK = true
+	for _, o := range t.owner {
+		switch {
+		case o == nil:
+			t.stateOK = false
+			continue
+		case o.Has(FlagFail):
+			t.stateOK = false
+			t.failSlots++
+		case o.Has(FlagPFail):
+			t.pfailSlots++
+		}
+		t.assignedSlots++
+	}
+}
+
+// SlotHealth reports slots whose owner is suspected (PFAIL) or failed (FAIL).
+func (t *Topology) SlotHealth() (pfail, fail int) { return t.pfailSlots, t.failSlots }
+
+// Serves reports whether slot s can be served right now. With full coverage
+// required (the default), any unserved or failed slot makes the whole
+// cluster refuse keyed commands; otherwise only that slot does.
+func (t *Topology) Serves(s uint16) bool {
+	if t.fullCoverage {
+		return t.stateOK
+	}
+	o := t.owner[s]
+	return o != nil && !o.Has(FlagFail)
 }
 
 // NodeID derives a stable 40-hex-char ID from a node name.
@@ -209,6 +250,7 @@ func Parse(r io.Reader, me string) (*Topology, error) {
 	}
 	t.Me.Flags |= FlagMyself
 	t.CurrentEpoch = t.MaxEpoch()
+	t.computeState(true)
 	return t, nil
 }
 
@@ -229,26 +271,11 @@ func parseRange(s string) (Range, error) {
 func (t *Topology) Owner(s uint16) *Node { return t.owner[s] }
 
 // StateOK is Redis's cluster_state:ok: every slot is served by a node that
-// isn't marked as failed. Otherwise keyed commands get CLUSTERDOWN.
-func (t *Topology) StateOK() bool {
-	for _, o := range t.owner {
-		if o == nil || o.Has(FlagFail) {
-			return false
-		}
-	}
-	return true
-}
+// isn't marked as failed.
+func (t *Topology) StateOK() bool { return t.stateOK }
 
 // AssignedSlots counts slots with an owner.
-func (t *Topology) AssignedSlots() int {
-	n := 0
-	for _, o := range t.owner {
-		if o != nil {
-			n++
-		}
-	}
-	return n
-}
+func (t *Topology) AssignedSlots() int { return t.assignedSlots }
 
 // ByID finds a node.
 func (t *Topology) ByID(id string) *Node {

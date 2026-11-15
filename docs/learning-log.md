@@ -696,3 +696,93 @@ size: I measured 13 messages a second per node at 50 nodes."
 
 2. Two nodes both claim slot 42. How does every node agree on the owner, without a vote?
 <details><summary>Answer</summary>Every claim travels with the claimer's config epoch, and every node applies the same rule: a claim replaces the current owner only if its epoch is higher. So every node independently picks the claim with the higher epoch. If the epochs are equal, the collision rule (smaller node ID bumps its epoch) makes them different first.</details>
+
+## Iteration 9: Failure detection + automatic failover
+
+**What we built**
+The cluster now heals itself. When a primary dies, the other nodes notice, a majority of primaries
+agree it's down, its most up-to-date replica wins an election, takes over its slots, and everyone
+reconfigures, all without a human. When the old primary comes back, it rejoins as a replica.
+Killing a real primary with `kill -9` under load, writes to its slots work again ~3 s later with a
+2 s node timeout, every time, across 60 runs.
+
+**How it works**
+```
+ t=0      primary a dies
+ t≈2s     every node: "no PONG from a for > node_timeout" → PFAIL (suspected)
+          gossip carries the suspicion; once a majority of primaries agree → FAIL, broadcast
+ +0.5-1s  replica d waits a ranked delay (most up-to-date replica waits least),
+          bumps the epoch (a cluster-wide logical clock), asks every primary for its vote
+          each primary votes at most once per epoch (saved to disk before replying)
+ +~10ms   d has a majority → takes the new epoch, promotes itself, claims a's slots
+          everyone accepts the claim: higher epoch wins (Iteration 8's rule)
+ later    a comes back, sees its slots taken with a higher epoch → becomes d's replica
+```
+- **Why a majority to declare FAIL?** So one node with a bad network link can't trigger a failover
+  of a healthy primary. We tested that: cut one link, and there's no failover.
+- **Why one vote per epoch?** Two replicas can't both collect a majority from the same voters in the
+  same epoch, so there's at most one winner per election.
+- **Why rank by replication offset?** The replica with the most data loses the fewest writes
+  (Iteration 6's Demo C, solved).
+
+**Why we did it this way**
+- *Timeout + majority detection (ADR 027),* compared with SWIM and phi-accrual.
+- *Replica election with primary voting (ADR 028),* compared with Raft. Same ideas (terms ≈
+  epochs, one vote per term, majority, freshest wins), but Raft only acknowledges what a majority
+  stored and never loses acknowledged writes. Redis Cluster replicates asynchronously, so it fails
+  over faster and can lose the in-flight writes.
+- *Stale replicas don't run (ADR 029):* better a shard down than an old copy served as current.
+
+**What can go wrong**
+- **Failover loses acknowledged writes:** in 16 of 60 runs, up to 146 per failover, all writes in
+  flight to the replica when the primary died.
+- **The node timeout is a tradeoff.** Smaller means faster failover (2.3 s at 1 s) but more false
+  alarms from GC pauses or network blips, and each false alarm can lose writes.
+- **The whole cluster refuses keyed commands during the gap** (full coverage, Redis's default).
+  `--cluster-require-full-coverage no` confines it to the failed shard.
+- **Clients can lag the cluster.** go-redis by default refreshes its slot map only on `MOVED` or
+  every 60 s, so it can keep hitting a dead primary for up to a minute after a 3 s failover.
+- **Bugs found while building:**
+  - A node that died right after answering a PING was *never* suspected, because reconnecting
+    failed and no PING was ever left unanswered. Fixed by counting a failed connect as a sent
+    PING, as Redis does.
+  - Message counters sized for 5 types crashed the bus on the first vote request.
+  - Checking the "Try it yourself" steps by hand, the failover *didn't happen*. Replica d had
+    dialed 127.0.0.1:7000 before node a had bound it, reached macOS's AirPlay Receiver (which
+    owns *:7000 and never replies), waited 10 s, and a was killed before d ever synced. d then
+    correctly refused to promote itself with no data (ADR 029 working as designed). Fixed the
+    setup: a 2 s handshake timeout, and the script starts primaries before replicas. After the
+    fix, the 15 s-timeout failover took 16.4 s and the old primary rejoined as a replica.
+
+**Try it yourself**
+```
+make cluster-up-local                          # 3 primaries + 3 replicas (node timeout 15s default)
+redis-cli -p 7000 cluster nodes | head -3
+kill -9 $(cat .cluster-local/a.pid)            # primary a dies
+redis-cli -p 7001 cluster nodes                # a: "master,fail?" then "master,fail"
+redis-cli -p 7003 role                         # ~16-18 s later: replica d is now "master"
+redis-cli -c -p 7001 set foo bar               # keyed writes work again
+make cluster-down-local; make cluster-up-local # a comes back...
+redis-cli -p 7000 role                         # ...as a replica ("slave") of d
+./bin/shardis-crashtest -cluster-failover 2000 -runs 5   # time it
+```
+
+**Interview question you can now answer**
+*"Walk me through what happens when a Redis Cluster primary dies."*
+"Every node pings its peers. When one hasn't answered for longer than the node timeout, the node
+marks it PFAIL, meaning suspected, and gossip carries that suspicion around. When a majority of
+primaries suspect the same node, it becomes FAIL and that's broadcast. A majority, so one bad link
+can't trigger a failover. Its replicas then wait a delay ranked by replication offset, so the
+most up-to-date one goes first, bump the epoch, and ask the primaries for votes. Each primary
+votes once per epoch, so there's at most one winner. The winner takes a higher config epoch and
+claims the slots, and everyone accepts the higher epoch. I measured about node timeout plus 1 to
+2.5 seconds, so 3 seconds with a 2 second timeout. It can lose writes that were in flight to the
+replica: I saw up to 146 in one failover. That's the price of asynchronous replication, unlike
+Raft."
+
+**Check yourself**
+1. Two replicas of the same dead primary start elections at the same moment, in the same epoch. Can both win?
+<details><summary>Answer</summary>No. To win, each needs votes from a majority of primaries, and each primary votes at most once per epoch (recorded on disk before it replies). Two majorities of the same set always overlap, so at least one primary would have to vote twice, which it won't. At worst the votes split, nobody wins, and they retry later in a higher epoch. The random part of the delay makes that rare.</details>
+
+2. Why does the cluster refuse to promote a replica whose link to the primary has been down for an hour?
+<details><summary>Answer</summary>Its data is an hour old. Promoting it would silently discard an hour of acknowledged writes and serve old data as if it were current. Keeping the shard down until the primary or a fresh replica returns is the lesser evil. That's Redis's cluster-replica-validity-factor (data older than 10 × node_timeout).</details>

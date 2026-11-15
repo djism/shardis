@@ -19,25 +19,37 @@ import (
 	"github.com/djism/shardis/internal/keyslot"
 )
 
-// Replicator is what the cluster needs from replication: when this node
-// becomes a replica (seed file or CLUSTER REPLICATE), start following the
-// primary. *replication.Node implements it.
+// Replicator is what the cluster needs from replication. *replication.Node
+// implements it.
 type Replicator interface {
+	// ReplicaOf starts following a primary (seed file, CLUSTER REPLICATE,
+	// or a failover that moved our primary's slots elsewhere).
 	ReplicaOf(host string, port int) error
+	// Promote stops replicating and makes this node a primary (it won a failover).
+	Promote()
+	// Offset is our replication offset, advertised in every bus header.
+	Offset() int64
+	// LinkDownFor is how long we've been cut off from our primary (0 = connected).
+	LinkDownFor() time.Duration
 }
 
 // Options configures a Cluster.
 type Options struct {
-	ClientAddr   string    // how clients reach this node (MOVED, CLUSTER SLOTS)
-	InternalAddr string    // how other nodes reach its client port (replication)
-	BusPort      int       // cluster bus port; 0 = internal port + 10000
-	Seed         *Topology // static topology to start from (optional)
-	StateFile    string    // nodes.conf path; "" = don't persist
-	NodeTimeout  time.Duration
-	Replicator   Replicator
-	Faults       *faults.Registry
-	Bus          *events.Bus
-	Log          *slog.Logger
+	// AllowPartialCoverage: by default (false, like Redis's
+	// cluster-require-full-coverage yes), if any slot is unserved or its owner
+	// is FAIL, every keyed command gets CLUSTERDOWN. true: only the affected
+	// slots fail and the rest of the cluster keeps serving.
+	AllowPartialCoverage bool
+	ClientAddr           string    // how clients reach this node (MOVED, CLUSTER SLOTS)
+	InternalAddr         string    // how other nodes reach its client port (replication)
+	BusPort              int       // cluster bus port; 0 = internal port + 10000
+	Seed                 *Topology // static topology to start from (optional)
+	StateFile            string    // nodes.conf path; "" = don't persist
+	NodeTimeout          time.Duration
+	Replicator           Replicator
+	Faults               *faults.Registry
+	Bus                  *events.Bus
+	Log                  *slog.Logger
 }
 
 // node is the mutable state behind a Node snapshot. Guarded by Cluster.mu.
@@ -55,6 +67,12 @@ type node struct {
 	link         *link
 	dialing      bool
 	meet         bool // send MEET instead of PING on the first message (we introduced it)
+
+	// Failure detection and failover (failover.go).
+	replOffset  int64                // its replication offset, from its last header
+	failReports map[string]time.Time // primary ID → when it last told us "I can't reach this node"
+	failTime    time.Time            // when we marked it FAIL
+	votedTime   time.Time            // when we last voted for one of its replicas (it being the failed primary)
 }
 
 func (n *node) busAddr() string {
@@ -74,14 +92,16 @@ type Cluster struct {
 	opts Options
 	log  *slog.Logger
 
-	mu           sync.Mutex
-	myself       *node
-	nodes        map[string]*node
-	owner        [keyslot.Count]*node
-	currentEpoch uint64
-	forgotten    map[string]time.Time // CLUSTER FORGET'd: ignore gossip about them until then
-	dirty        bool                 // nodes.conf needs saving
-	rng          *mrand.Rand
+	mu            sync.Mutex
+	myself        *node
+	nodes         map[string]*node
+	owner         [keyslot.Count]*node
+	currentEpoch  uint64
+	forgotten     map[string]time.Time // CLUSTER FORGET'd: ignore gossip about them until then
+	lastVoteEpoch uint64               // the epoch we last voted in: at most one vote per epoch, saved in nodes.conf
+	election      election             // our own run for primary, when our primary has failed
+	dirty         bool                 // nodes.conf needs saving
+	rng           *mrand.Rand
 
 	view atomic.Pointer[Topology]
 
@@ -96,7 +116,7 @@ type Cluster struct {
 // Stats are bus message counters (CLUSTER INFO, benchmarks).
 type Stats struct {
 	Sent, Received, BytesSent, BytesReceived, Dropped atomic.Int64
-	SentByType, ReceivedByType                        [5]atomic.Int64
+	SentByType, ReceivedByType                        [numMsgTypes]atomic.Int64
 }
 
 func randomID() string {
@@ -191,7 +211,7 @@ func (c *Cluster) publish() {
 		n := c.nodes[id]
 		sn := &Node{Name: n.name, ID: n.id, Addr: n.clientAddr, Internal: n.internalAddr, BusPort: n.busPort,
 			Epoch: n.configEpoch, Flags: n.flags, PingSent: n.pingSent, PongRecv: n.pongRecv,
-			LinkUp: n.link != nil || n == c.myself}
+			LinkUp: n.link != nil || n == c.myself, ReplOffset: n.replOffset, FailReports: len(n.failReports)}
 		snap[n] = sn
 		t.Nodes = append(t.Nodes, sn)
 	}
@@ -212,6 +232,7 @@ func (c *Cluster) publish() {
 		}
 	}
 	t.Me = snap[c.myself]
+	t.computeState(!c.opts.AllowPartialCoverage)
 	c.view.Store(t)
 }
 
@@ -411,7 +432,7 @@ func (c *Cluster) buildMessage(typ uint8, to *node) *message {
 	me := c.myself
 	m := &message{typ: typ, sender: me.id, currentEpoch: c.currentEpoch, configEpoch: me.configEpoch,
 		flags: wireFlags(me.flags), primaryID: me.primaryID, busPort: uint16(me.busPort),
-		clientAddr: me.clientAddr, internalAddr: me.internalAddr}
+		clientAddr: me.clientAddr, internalAddr: me.internalAddr, offset: uint64(max(c.myOffset(), 0))}
 	if me.flags&FlagReplica != 0 {
 		// Like Redis, a replica advertises its primary's config epoch.
 		if p := c.nodes[me.primaryID]; p != nil {

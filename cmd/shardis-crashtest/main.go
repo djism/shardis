@@ -25,6 +25,12 @@
 // lacks (see failover.go).
 //
 //	shardis-crashtest -failover plain,wait,slowlink,slowlink+wait -runs 10
+//
+// With -cluster-failover it measures automatic failover in a 6-node cluster:
+// kill a primary, time how long until its replica accepts writes for its
+// slots (see cluster_failover.go).
+//
+//	shardis-crashtest -cluster-failover 2000,5000 -runs 20
 package main
 
 import (
@@ -67,10 +73,15 @@ func main() {
 	flag.DurationVar(&o.minLoad, "min-load", 1500*time.Millisecond, "shortest time under load before the crash")
 	flag.DurationVar(&o.maxLoad, "max-load", 3*time.Second, "longest time under load before the crash")
 	failover := flag.String("failover", "", "replication failover test instead: variants plain,wait,slowlink,slowlink+wait")
+	clusterFailover := flag.String("cluster-failover", "", "cluster failover timing instead: node timeouts in ms, e.g. 2000,5000")
 	flag.Parse()
 	o.policies, o.modes = strings.Split(policies, ","), strings.Split(modes, ",")
 	if *failover != "" {
 		runFailover(o, strings.Split(*failover, ","))
+		return
+	}
+	if *clusterFailover != "" {
+		runClusterFailover(o, strings.Split(*clusterFailover, ","))
 		return
 	}
 

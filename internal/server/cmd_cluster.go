@@ -32,6 +32,11 @@ func (s *Server) route(cl *client, cmd command, keys [][]byte) string {
 	if owner == nil {
 		return "CLUSTERDOWN Hash slot not served"
 	}
+	if !t.Serves(slot) {
+		// A failed primary and no replica has taken over yet (or, with full
+		// coverage required, any slot anywhere is down).
+		return "CLUSTERDOWN The cluster is down"
+	}
 	if owner == me {
 		return ""
 	}
@@ -309,13 +314,14 @@ func clusterInfo(t *cluster.Topology, st *cluster.Stats) string {
 			size++
 		}
 	}
+	pfail, fail := t.SlotHealth()
 	var b strings.Builder
 	for _, kv := range [][2]string{
 		{"cluster_state", state},
 		{"cluster_slots_assigned", strconv.Itoa(t.AssignedSlots())},
-		{"cluster_slots_ok", strconv.Itoa(t.AssignedSlots())},
-		{"cluster_slots_pfail", "0"},
-		{"cluster_slots_fail", "0"},
+		{"cluster_slots_ok", strconv.Itoa(t.AssignedSlots() - pfail - fail)},
+		{"cluster_slots_pfail", strconv.Itoa(pfail)},
+		{"cluster_slots_fail", strconv.Itoa(fail)},
 		{"cluster_known_nodes", strconv.Itoa(len(t.Nodes))},
 		{"cluster_size", strconv.Itoa(size)},
 		{"cluster_current_epoch", strconv.FormatUint(t.CurrentEpoch, 10)},

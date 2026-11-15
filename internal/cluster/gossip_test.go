@@ -39,16 +39,50 @@ func freePort(t testing.TB) int {
 }
 
 type fakeReplicator struct {
-	mu   sync.Mutex
-	host string
-	port int
+	mu       sync.Mutex
+	host     string
+	port     int
+	promoted bool
+	offset   int64
+	linkDown time.Duration
 }
 
 func (f *fakeReplicator) ReplicaOf(host string, port int) error {
 	f.mu.Lock()
 	f.host, f.port = host, port
+	f.promoted = false
 	f.mu.Unlock()
 	return nil
+}
+
+func (f *fakeReplicator) Promote() {
+	f.mu.Lock()
+	f.promoted = true
+	f.mu.Unlock()
+}
+
+func (f *fakeReplicator) Offset() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.offset
+}
+
+func (f *fakeReplicator) LinkDownFor() time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.linkDown
+}
+
+func (f *fakeReplicator) set(offset int64, linkDown time.Duration) {
+	f.mu.Lock()
+	f.offset, f.linkDown = offset, linkDown
+	f.mu.Unlock()
+}
+
+func (f *fakeReplicator) state() (string, int, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.host, f.port, f.promoted
 }
 
 type testNode struct {

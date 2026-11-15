@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ type testCluster struct {
 type clusterNode struct {
 	name, addr string
 	port       int
+	stop       func() // like the process dying
 }
 
 func startCluster(t *testing.T) *testCluster {
@@ -79,11 +81,13 @@ func startCluster(t *testing.T) *testCluster {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() { s.Serve(ctx); close(done) }()
-		t.Cleanup(func() { cl.Close(); node.Close(); cancel(); <-done; engine.Close() })
+		var once sync.Once
+		stop := func() { once.Do(func() { cl.Close(); node.Close(); cancel(); <-done; engine.Close() }) }
+		t.Cleanup(stop)
 		if err := cl.Start(); err != nil { // replicas start replicating from here
 			t.Fatal(err)
 		}
-		tc.nodes[n] = &clusterNode{name: n, addr: fmt.Sprintf("127.0.0.1:%d", ports[n]), port: ports[n]}
+		tc.nodes[n] = &clusterNode{name: n, addr: fmt.Sprintf("127.0.0.1:%d", ports[n]), port: ports[n], stop: stop}
 	}
 	for _, n := range []string{"d", "e", "f"} {
 		c := newClient(t, tc.nodes[n].addr)
@@ -301,4 +305,66 @@ func TestRedisCLIFollowsMoved(t *testing.T) {
 	if got := newClient(t, tc.nodes["c"].addr).do("GET", kc); got != `"hello"` {
 		t.Fatalf("the key should live on node c, got %s", got)
 	}
+}
+
+// End to end: a real primary dies; its replica wins the election and serves
+// the slots; data written before the crash (and replicated) is there; a
+// go-redis ClusterClient keeps working after refreshing its slot map.
+func TestFailoverEndToEnd(t *testing.T) {
+	tc := startCluster(t)
+	ctx := context.Background()
+	// go-redis refreshes its slot map only on MOVED, or every
+	// ClusterStateReloadInterval (default 60 s). A connection error to a dead
+	// primary does NOT trigger a refresh, so with defaults it can keep failing
+	// for up to a minute after the cluster has already failed over. Our own
+	// client (Iteration 12) will refresh on connection errors.
+	rdb := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{tc.nodes["b"].addr}, MaxRedirects: 8,
+		ClusterStateReloadInterval: time.Second})
+	defer rdb.Close()
+	ka := tc.keyIn("a")
+	if err := rdb.Set(ctx, ka, "before", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	d := newClient(t, tc.nodes["d"].addr)
+	d.do("READONLY")
+	eventually(t, "replicated to d", func() bool { return d.do("GET", ka) == `"before"` })
+
+	start := time.Now()
+	tc.nodes["a"].stop() // the primary dies
+	moved := fmt.Sprintf("MOVED %d %s", keyslot.Of([]byte(ka)), tc.nodes["a"].addr)
+	deadline := time.Now().Add(20 * time.Second)
+	for { // probe the replica until it takes writes for a's slots
+		got := d.do("SET", ka, "after")
+		if got == "OK" {
+			break
+		}
+		if got != moved && !strings.HasPrefix(got, "CLUSTERDOWN") {
+			t.Fatalf("unexpected reply during failover: %q", got)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("d never took over (last reply %q)", got)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Logf("writes to the dead primary's slots accepted again after %v (node timeout 2s)", time.Since(start))
+	if role := d.do("ROLE"); !strings.HasPrefix(role, `["master"`) {
+		t.Fatalf("d's role after failover: %s", role)
+	}
+	b := newClient(t, tc.nodes["b"].addr)
+	eventually(t, "cluster ok on b with d owning a's slots", func() bool {
+		return clusterInfoField(t, b, "cluster_state") == "ok" &&
+			strings.Contains(b.do("CLUSTER", "SLOTS"), fmt.Sprintf(`(int) %d`, tc.nodes["d"].port))
+	})
+	// The client refreshes its map (MOVED/connection errors) and carries on.
+	var lastErr error
+	var lastVal string
+	defer func() {
+		if t.Failed() {
+			t.Logf("last go-redis result: %q, %v", lastVal, lastErr)
+		}
+	}()
+	eventually(t, "go-redis reads through the new primary", func() bool {
+		lastVal, lastErr = rdb.Get(ctx, ka).Result()
+		return lastErr == nil && lastVal == "after"
+	})
 }

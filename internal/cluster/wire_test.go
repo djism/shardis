@@ -8,7 +8,7 @@ import (
 
 func sampleMessage() *message {
 	m := &message{
-		typ: msgPing, sender: NodeID("a"), currentEpoch: 7, configEpoch: 3, flags: wirePrimary,
+		typ: msgPing, sender: NodeID("a"), currentEpoch: 7, configEpoch: 3, flags: wirePrimary, offset: 123456,
 		busPort: 17000, clientAddr: "127.0.0.1:7000", internalAddr: "shardis-a:7000",
 		gossip: []gossipEntry{
 			{id: NodeID("b"), flags: wirePrimary | wirePFail, busPort: 17001, pingSentAgo: 1500, pongRecvAgo: 20, clientAddr: "127.0.0.1:7001", internalAddr: "shardis-b:7000"},

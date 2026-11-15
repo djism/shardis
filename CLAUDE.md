@@ -130,7 +130,7 @@ internal/store/       in-memory keyspace (one map per hash slot), engines (shard
 internal/keyslot/     CRC16 + hash tags → slot (verified against real Redis)
 internal/persist/     AOF (effects log, group commit, fsync policies), manifest, fuzzy rewrite
 internal/replication/ PSYNC, backlog, full/partial sync, WAIT, promotion
-internal/cluster/     topology snapshots, cluster bus (wire format, gossip), nodes.conf; later failover, resharding
+internal/cluster/     topology snapshots, cluster bus (wire, gossip), failure detection + failover, nodes.conf
 internal/events/      event bus
 internal/faults/      deterministic fault injection (FAULT SET repl.stream pause|delay|sever)
 pkg/client/           our own "smart" cluster client
@@ -165,6 +165,8 @@ make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* en
                   # --cluster-config deploy/local/topology.conf --cluster-node a   (seed file, ADR 021-023)
                   # --cluster-enabled yes   (fresh node; form with CLUSTER MEET/ADDSLOTS/REPLICATE
                   #   or redis-cli --cluster create; state saved in <dir>/nodes.conf, ADR 024-026)
+                  # --cluster-node-timeout 15000 (failure detection, ADR 027-029)
+                  # --cluster-require-full-coverage yes|no
 SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
 bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
 bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
@@ -175,6 +177,8 @@ bin/shardis-loadgen -addr 127.0.0.1:7000          # Zipf cache-aside traffic: hi
 bin/shardis-crashtest -runs 10                    # kill -9 / simulated power cut, lost acked writes
 bash docs/benchmarks/iter-05-persistence/run.sh   # crash table + throughput per fsync policy (~10 min)
 bin/shardis-crashtest -failover plain,wait,slowlink,slowlink+wait   # replication lost-write window
+bin/shardis-crashtest -cluster-failover 2000,5000 -runs 20          # automatic failover time
+bash docs/benchmarks/iter-09-failover/run.sh      # the failover timing table (~7 min)
 bash docs/benchmarks/iter-06-replication/run.sh   # the full failover table (~4 min)
 bash docs/benchmarks/iter-07-cluster/run.sh       # single node vs cluster, Shardis and Redis (~3 min)
 SHARDIS_GOSSIP_BENCH=$PWD/docs/benchmarks/iter-08-gossip/raw.csv go test ./internal/cluster -run TestGossipScaling -v -timeout 20m

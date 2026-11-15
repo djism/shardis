@@ -127,6 +127,9 @@ func (c *Cluster) serveInbound(conn net.Conn) {
 		if reply == nil {
 			continue
 		}
+		if reply.typ == msgAuthAck {
+			c.saveIfDirty() // the vote must be on disk before anyone hears about it
+		}
 		if c.dropTo(to, m.sender) {
 			c.stats.Dropped.Add(1)
 			continue
@@ -221,6 +224,12 @@ func (c *Cluster) cron() {
 				c.ping(n, now)
 			}
 		}
+		if c.detectFailures(now) {
+			changed = true
+		}
+		if c.considerFailover(now) {
+			changed = true
+		}
 		if changed {
 			c.dirty = true
 			c.publish()
@@ -270,6 +279,13 @@ func (c *Cluster) dial(n *node) {
 	defer c.mu.Unlock()
 	n.dialing = false
 	if err != nil {
+		// Can't even connect. Count it as a PING sent now (if none is
+		// pending), or a node that dies right after answering a PING would
+		// never look unreachable: no PING could ever go unanswered.
+		if n.pingSent.IsZero() && n.flags&FlagHandshake == 0 {
+			n.pingSent = time.Now()
+			c.publish()
+		}
 		return // cron retries next tick
 	}
 	if c.nodes[n.id] != n || n.link != nil {
@@ -357,10 +373,23 @@ func (c *Cluster) linkDown(l *link) {
 // returns the PONG to send back (and the node it goes to). l is the link it
 // arrived on if it's a reply on one of our outbound links, else nil.
 func (c *Cluster) process(m *message, l *link) (*message, *node) {
+	reply, to, replicateFrom := c.processLocked(m, l)
+	if replicateFrom != "" { // our slots (or our primary's) moved: follow the new owner
+		go func() {
+			if err := c.startReplication(replicateFrom); err != nil {
+				c.log.Error("couldn't start replicating from the new primary", "addr", replicateFrom, "err", err)
+			}
+		}()
+	}
+	return reply, to
+}
+
+func (c *Cluster) processLocked(m *message, l *link) (reply *message, to *node, replicateFrom string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if until, ok := c.forgotten[m.sender]; ok && time.Now().Before(until) {
-		return nil, nil
+	now := time.Now()
+	if until, ok := c.forgotten[m.sender]; ok && now.Before(until) {
+		return nil, nil, ""
 	}
 	changed := false
 	if m.currentEpoch > c.currentEpoch {
@@ -375,7 +404,7 @@ func (c *Cluster) process(m *message, l *link) (*message, *node) {
 			c.publish()
 		}
 		l.close()
-		return nil, nil
+		return nil, nil, ""
 	}
 	// A PONG on a link to a handshake node tells us who that node really is.
 	if l != nil && m.typ == msgPong && l.n.flags&FlagHandshake != 0 && l.n.id != m.sender {
@@ -399,20 +428,28 @@ func (c *Cluster) process(m *message, l *link) (*message, *node) {
 			// Only a MEET may introduce a new node directly; a stray PING
 			// from a stranger gets a PONG but doesn't join it to our view.
 			if m.typ == msgPing {
-				return c.buildMessage(msgPong, nil), nil
+				return c.buildMessage(msgPong, nil), nil, ""
 			}
-			return nil, nil
+			return nil, nil, ""
 		}
 		sender = &node{id: m.sender, flags: FlagHandshake, created: time.Now()}
 		c.nodes[sender.id] = sender
 		changed = true
 		c.log.Info("met by a new node", "id", m.sender[:8], "addr", m.internalAddr)
 	}
-	if c.updateFromHeader(sender, m) {
+	sender.replOffset = int64(m.offset)
+	upd, addr := c.updateFromHeader(sender, m)
+	if upd {
 		changed = true
 	}
+	replicateFrom = addr
+	if m.typ == msgPing || m.typ == msgPong || m.typ == msgMeet {
+		if c.heardFrom(sender, now) {
+			changed = true
+		}
+	}
 	if m.typ == msgPong && l != nil && l.n == sender {
-		sender.pongRecv, sender.pingSent = time.Now(), time.Time{}
+		sender.pongRecv, sender.pingSent = now, time.Time{}
 		changed = true // fresh timestamps belong in the snapshot (CLUSTER NODES, failure detection)
 		if sender.flags&FlagHandshake != 0 {
 			sender.flags &^= FlagHandshake
@@ -422,8 +459,28 @@ func (c *Cluster) process(m *message, l *link) (*message, *node) {
 			c.log.Info("node joined", "id", sender.id[:8], "addr", sender.clientAddr)
 		}
 	}
-	if c.handleGossip(sender, m.gossip) {
+	if c.handleGossip(sender, m.gossip, now) {
 		changed = true
+	}
+	switch m.typ {
+	case msgFail: // "this node is FAIL": accepted from any confirmed node, no vote needed
+		if sender.flags&FlagHandshake == 0 && len(m.gossip) == 1 {
+			if x := c.nodes[m.gossip[0].id]; x != nil && x != c.myself && x.flags&FlagFail == 0 {
+				c.setFail(x, now)
+				changed = true
+				c.log.Warn("node FAIL (told by peer)", "node", x.label(), "by", sender.label())
+			}
+		}
+	case msgAuthReq:
+		if ack := c.handleAuthRequest(sender, m, now); ack != nil {
+			changed = true
+			c.publish()
+			return ack, sender, replicateFrom
+		}
+	case msgAuthAck:
+		if c.handleAuthAck(sender, m) {
+			changed = true
+		}
 	}
 	if c.opts.Bus.Active() {
 		ids := make([]string, len(m.gossip))
@@ -437,17 +494,16 @@ func (c *Cluster) process(m *message, l *link) (*message, *node) {
 		c.publish()
 	}
 	if m.typ == msgPing || m.typ == msgMeet {
-		return c.buildMessage(msgPong, sender), sender
+		return c.buildMessage(msgPong, sender), sender, replicateFrom
 	}
-	return nil, nil
+	return nil, nil, replicateFrom
 }
 
 // updateFromHeader copies what a node says about itself: addresses, role,
 // config epoch, and the slots it claims. A claim wins a slot only if the
 // slot is free or the claimer's config epoch is higher than the current
 // owner's: epochs settle conflicts (the rule failover relies on).
-func (c *Cluster) updateFromHeader(n *node, m *message) bool {
-	changed := false
+func (c *Cluster) updateFromHeader(n *node, m *message) (changed bool, replicateFrom string) {
 	if n.clientAddr != m.clientAddr || n.internalAddr != m.internalAddr || n.busPort != int(m.busPort) {
 		n.clientAddr, n.internalAddr, n.busPort = m.clientAddr, m.internalAddr, int(m.busPort)
 		changed = true
@@ -461,27 +517,38 @@ func (c *Cluster) updateFromHeader(n *node, m *message) bool {
 		n.primaryID = m.primaryID
 		changed = true
 	}
-	if role == FlagReplica {
-		return changed // a replica's header carries its primary's epoch, not a claim of its own
+	if role == FlagReplica || m.typ == msgAuthReq {
+		return changed, "" // a replica's header carries its primary's epoch, not a claim of its own
 	}
 	if n.configEpoch != m.configEpoch {
 		n.configEpoch = m.configEpoch
 		changed = true
 	}
+	myPrimary := c.nodes[c.myself.primaryID]
+	iLost, primaryLost := false, false
 	for s := range len(c.owner) {
 		if !m.hasSlot(s) || c.owner[s] == n {
 			continue
 		}
 		if cur := c.owner[s]; cur == nil || n.configEpoch > cur.configEpoch {
+			if cur == c.myself {
+				iLost = true
+			}
+			if cur != nil && cur == myPrimary {
+				primaryLost = true
+			}
 			c.owner[s] = n
 			changed = true
 		}
+	}
+	if iLost || primaryLost {
+		replicateFrom = c.adoptNewOwner(n, iLost, primaryLost)
 	}
 	if c.myself.flags&FlagPrimary != 0 && n.configEpoch == c.myself.configEpoch && n != c.myself {
 		c.resolveEpochCollision(n)
 		changed = true
 	}
-	return changed
+	return changed, replicateFrom
 }
 
 // resolveEpochCollision: two primaries with the same config epoch can't be
@@ -497,15 +564,22 @@ func (c *Cluster) resolveEpochCollision(other *node) {
 	c.log.Info("config epoch collision resolved", "with", other.label(), "new_epoch", c.myself.configEpoch)
 }
 
-// handleGossip starts a handshake with any node the sender knows that we
-// don't. (Failure reports, Iteration 9, will also be read here.)
-func (c *Cluster) handleGossip(sender *node, entries []gossipEntry) bool {
+// handleGossip records failure reports (what a primary says about other
+// nodes' health) and starts a handshake with any node the sender knows that
+// we don't.
+func (c *Cluster) handleGossip(sender *node, entries []gossipEntry, now time.Time) bool {
 	if sender.flags&FlagHandshake != 0 {
 		return false // don't take introductions from a node we haven't confirmed
 	}
 	changed := false
 	for _, g := range entries {
-		if g.id == c.myself.id || c.nodes[g.id] != nil {
+		if g.id == c.myself.id {
+			continue
+		}
+		if known := c.nodes[g.id]; known != nil {
+			if c.noteFailureReport(known, sender, g.flags, now) {
+				changed = true
+			}
 			continue
 		}
 		if until, ok := c.forgotten[g.id]; ok && time.Now().Before(until) {

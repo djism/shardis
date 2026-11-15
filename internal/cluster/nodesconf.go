@@ -20,6 +20,7 @@ import (
 //
 //	myself <id>
 //	epoch <currentEpoch>
+//	vote <lastVoteEpoch>    (a primary votes at most once per epoch, even across restarts)
 //	node <id> <name|-> <client-addr> <internal-addr> <bus-port> <primary|replica> <primary-id|-> <config-epoch> <slots...>
 //
 // It's rewritten atomically (temp file, fsync, rename, fsync dir), like the
@@ -48,7 +49,7 @@ func (c *Cluster) saveIfDirty() {
 func (c *Cluster) encodeState() []byte {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Shardis cluster state. Written by the server; don't edit while it runs.\n")
-	fmt.Fprintf(&b, "myself %s\nepoch %d\n", c.myself.id, c.currentEpoch)
+	fmt.Fprintf(&b, "myself %s\nepoch %d\nvote %d\n", c.myself.id, c.currentEpoch, c.lastVoteEpoch)
 	for _, n := range c.nodes {
 		if n.flags&FlagHandshake != 0 {
 			continue // unconfirmed; we'll meet it again if it's real
@@ -119,6 +120,15 @@ func (c *Cluster) loadState() (bool, error) {
 				return false, bad
 			}
 			c.currentEpoch = e
+		case "vote":
+			if len(f) != 2 {
+				return false, bad
+			}
+			v, err := strconv.ParseUint(f[1], 10, 64)
+			if err != nil {
+				return false, bad
+			}
+			c.lastVoteEpoch = v
 		case "node":
 			if len(f) < 9 {
 				return false, bad

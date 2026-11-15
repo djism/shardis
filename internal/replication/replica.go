@@ -100,7 +100,12 @@ func (n *Node) syncOnce(stop chan struct{}) error {
 		}
 	}()
 	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(n.opts.Timeout))
+	// A real primary answers the handshake at once, so give it 2 s, not the
+	// full link timeout. Something listening on the port that never replies
+	// (on macOS, AirPlay Receiver accepts connections on *:7000 and stays
+	// silent) then costs a 2 s retry instead of 10 s of believing we're
+	// connected while getting no data.
+	conn.SetReadDeadline(time.Now().Add(min(n.opts.Timeout, 2*time.Second)))
 
 	// Handshake, the same steps a Redis replica takes.
 	if _, err := c.call("PING"); err != nil {
@@ -121,6 +126,7 @@ func (n *Node) syncOnce(stop chan struct{}) error {
 	}
 	n.mu.Unlock()
 	n.linkStatus.Store("sync")
+	conn.SetReadDeadline(time.Now().Add(n.opts.Timeout)) // a full sync's snapshot can take a while
 	reply, err := c.call("PSYNC", replid, strconv.FormatInt(off, 10))
 	if err != nil {
 		return err
