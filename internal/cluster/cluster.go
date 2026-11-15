@@ -117,10 +117,12 @@ type Cluster struct {
 	stats Stats
 }
 
-// Stats are bus message counters (CLUSTER INFO, benchmarks).
+// Stats are bus message counters (CLUSTER INFO, benchmarks) and counts of
+// the failure-handling steps this node took (Prometheus metrics, ADR 045).
 type Stats struct {
-	Sent, Received, BytesSent, BytesReceived, Dropped atomic.Int64
-	SentByType, ReceivedByType                        [numMsgTypes]atomic.Int64
+	Sent, Received, BytesSent, BytesReceived, Dropped                     atomic.Int64
+	SentByType, ReceivedByType                                            [numMsgTypes]atomic.Int64
+	PFailMarks, FailMarks, Elections, FailoversWon, Takeovers, EpochBumps atomic.Int64
 }
 
 func randomID() string {

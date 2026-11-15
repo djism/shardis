@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 2s       # short, so a 3 s failover is visible; fine for a laptop
+  evaluation_interval: 2s
+scrape_configs:
+  - job_name: shardis
+    static_configs:
+      - {targets: ["host.docker.internal:9121"], labels: {node: a}}
+      - {targets: ["host.docker.internal:9122"], labels: {node: b}}
+      - {targets: ["host.docker.internal:9123"], labels: {node: c}}
+      - {targets: ["host.docker.internal:9124"], labels: {node: d}}
+      - {targets: ["host.docker.internal:9125"], labels: {node: e}}
+      - {targets: ["host.docker.internal:9126"], labels: {node: f}}

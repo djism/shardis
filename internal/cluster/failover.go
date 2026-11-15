@@ -91,6 +91,7 @@ func (c *Cluster) detectFailures(now time.Time) (changed bool) {
 			n.flags |= FlagPFail
 			changed = true
 			c.log.Warn("node unreachable (PFAIL)", "node", n.label(), "waited", now.Sub(n.pingSent).Round(time.Millisecond))
+			c.stats.PFailMarks.Add(1)
 			c.emit("pfail", map[string]any{"node": n.label(), "by": c.myself.label()})
 		}
 		if n.flags&FlagPFail != 0 && c.markFailIfMajority(n, now) {
@@ -126,6 +127,7 @@ func (c *Cluster) markFailIfMajority(n *node, now time.Time) bool {
 func (c *Cluster) setFail(n *node, now time.Time) {
 	n.flags = n.flags&^FlagPFail | FlagFail
 	n.failTime = now
+	c.stats.FailMarks.Add(1)
 	c.emit("fail", map[string]any{"node": n.label(), "by": c.myself.label(), "reports": len(n.failReports)})
 }
 
@@ -233,6 +235,7 @@ func (c *Cluster) considerFailover(now time.Time) (changed bool) {
 			}
 		}
 		c.log.Info("election started", "epoch", e.epoch, "quorum", c.quorum())
+		c.stats.Elections.Add(1)
 		c.emit("election_start", map[string]any{"node": me.label(), "epoch": e.epoch, "primary": primary.label(), "rank": e.rank})
 	case !e.sentAt.IsZero() && now.Sub(e.sentAt) > c.authTimeout():
 		c.log.Warn("election timed out; will retry", "epoch", e.epoch, "votes", len(e.votes), "quorum", c.quorum())
@@ -273,6 +276,7 @@ func (c *Cluster) winElection() {
 		}
 	}
 	c.log.Warn("won the election: now primary", "epoch", me.configEpoch, "slots", taken, "votes", len(c.election.votes))
+	c.stats.FailoversWon.Add(1)
 	c.emit("failover_won", map[string]any{"node": me.label(), "epoch": me.configEpoch, "slots": taken,
 		"votes": len(c.election.votes), "old_primary": old.label()})
 	c.election = election{}

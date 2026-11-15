@@ -17,3 +17,4 @@ data:
   SHARDIS_APPENDFSYNC: everysec
   SHARDIS_MAXMEMORY: 200mb
   SHARDIS_MAXMEMORY_POLICY: allkeys-lru      # it's a cache
+  SHARDIS_METRICS_PORT: "9121"               # Prometheus /metrics, /healthz, /readyz (ADR 045)

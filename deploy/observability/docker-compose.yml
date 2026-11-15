@@ -1,0 +1,27 @@
+# Prometheus + Grafana for a local cluster (deploy/local/cluster.sh), whose
+# nodes serve /metrics on 127.0.0.1:9121-9126.
+#
+#   make cluster-up-local
+#   docker compose -f deploy/observability/docker-compose.yml up -d
+#   open http://127.0.0.1:3000/d/shardis      (Grafana, no login: anonymous viewer)
+#   open http://127.0.0.1:9090                (Prometheus)
+#
+# Both ports are bound to 127.0.0.1 only: anonymous Grafana is for a laptop.
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=2d"]
+    volumes: ["./prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["127.0.0.1:9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/shardis.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on: [prometheus]

@@ -19,6 +19,9 @@ spec:
   template:
     metadata:
       labels: {app.kubernetes.io/name: shardis, app.kubernetes.io/component: server}
+      annotations: # for a Prometheus that discovers pods by annotation
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
     spec:
       # SIGTERM → a primary hands its slots to its replica, then exits
       # (ADR 043). That takes milliseconds; 30 s is plenty of slack.
@@ -40,6 +43,7 @@ spec:
           ports:
             - {name: client, containerPort: 7000}
             - {name: bus, containerPort: 17000}
+            - {name: metrics, containerPort: 9121}
           # Ready = accepting connections (the AOF has been replayed by then).
           # Not "cluster_state:ok": that would pull every pod out of DNS the
           # moment one shard fails, and they'd never find each other again.

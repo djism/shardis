@@ -11,9 +11,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/djism/shardis/internal/cluster"
 	"github.com/djism/shardis/internal/events"
@@ -59,6 +62,12 @@ type Server struct {
 	migrateConns migrateConns
 	writesPaused atomic.Bool // graceful handoff in progress (ADR 043)
 
+	// Metrics (ADR 045): per command, one add to the connection's own counter;
+	// every 16th command, one histogram observation. The rest is read at scrape.
+	latency   prometheus.Histogram
+	cmdNames  []string                  // command id → name
+	callsDone [maxCommands]atomic.Int64 // calls by connections that have closed
+
 	ln net.Listener
 
 	mu      sync.Mutex
@@ -81,6 +90,25 @@ func New(opts Options) *Server {
 		conns: make(map[net.Conn]*client), started: time.Now(), gates: new(slotGates),
 	}
 	s.commands = s.commandTable()
+	names := make([]string, 0, len(s.commands))
+	for name := range s.commands {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	if len(names) > maxCommands {
+		panic("server: more commands than maxCommands")
+	}
+	for id, name := range names {
+		c := s.commands[name]
+		c.id = id
+		s.commands[name] = c
+	}
+	s.cmdNames = names
+	s.latency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "shardis_command_duration_seconds",
+		Help:    "Time to run a command on the server (excluding network and AOF wait).",
+		Buckets: []float64{1e-6, 5e-6, 1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 5e-4, 1e-3, 5e-3, 1e-2, 0.1, 1},
+	})
 	return s
 }
 
@@ -156,6 +184,11 @@ func (s *Server) untrack(c net.Conn) {
 	s.mu.Lock()
 	if cl := s.conns[c]; cl != nil {
 		s.cmdsDone.Add(cl.cmds.Load())
+		for i := range cl.calls {
+			if n := cl.calls[i].Load(); n > 0 {
+				s.callsDone[i].Add(n)
+			}
+		}
 	}
 	delete(s.conns, c)
 	s.mu.Unlock()
@@ -205,6 +238,8 @@ type client struct {
 	// server-wide counter, so 10 cores running commands don't all fight over
 	// the same memory. INFO adds them up.
 	cmds atomic.Int64
+	// calls counts this connection's commands by command id (metrics).
+	calls [maxCommands]atomic.Int64
 }
 
 func (s *Server) handle(c net.Conn) {
@@ -313,3 +348,40 @@ func (f flushBeforeRead) Read(p []byte) (int, error) {
 	}
 	return f.conn.Read(p)
 }
+
+// CommandCalls returns how many times each command has run: closed
+// connections' totals plus every open connection's counters.
+func (s *Server) CommandCalls() map[string]int64 {
+	var sum [maxCommands]int64
+	for i := range sum {
+		sum[i] = s.callsDone[i].Load()
+	}
+	s.mu.Lock()
+	for _, cl := range s.conns {
+		if cl != nil {
+			for i := range cl.calls {
+				sum[i] += cl.calls[i].Load()
+			}
+		}
+	}
+	s.mu.Unlock()
+	out := map[string]int64{}
+	for id, name := range s.cmdNames {
+		if sum[id] > 0 {
+			out[name] = sum[id]
+		}
+	}
+	return out
+}
+
+// Latency is the command duration histogram, for the metrics registry.
+func (s *Server) Latency() prometheus.Histogram { return s.latency }
+
+// Clients is the number of open connections.
+func (s *Server) Clients() int {
+	n, _ := s.clientStats()
+	return n
+}
+
+// Engine is the store engine (for metrics).
+func (s *Server) Engine() store.Engine { return s.engine }

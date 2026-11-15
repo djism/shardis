@@ -121,7 +121,7 @@ These records feed the "Design decisions" section of the website, so write them 
 cmd/shardis/          server binary
 cmd/shardis-loadgen/  Zipf "cache-aside" load generator (hit rate, latency)
 cmd/shardis-crashtest/ crash a real server mid-load, count lost acknowledged writes
-cmd/shardis-observer/ streams cluster events over WebSocket for the website
+cmd/shardis-observer/ EVENTS from every node + topology → WebSocket /ws; /api/actions (local only)
 cmd/shardis-chaos/    7 chaos scenarios on real processes + history checker; traces → website/public/traces
 cmd/shardis-admin/    add-node / reshard / rebalance / remove-node / fix (thin wrapper over internal/admin)
 internal/resp/        protocol parser/writer
@@ -134,7 +134,9 @@ internal/replication/ PSYNC, backlog, full/partial sync, WAIT, promotion
 internal/cluster/     topology snapshots, cluster bus (wire, gossip), failure detection + failover, nodes.conf
 internal/events/      event bus
 internal/faults/      deterministic fault injection (FAULT SET repl.stream pause|delay|sever)
-internal/admin/       cluster operations as a library: AddNode, Reshard, Rebalance, Fix, RemoveNode
+internal/admin/       cluster operations as a library: Create, AddNode, Reshard, Rebalance, Fix, RemoveNode
+internal/metrics/     Prometheus collector (read at scrape time) + /metrics /healthz /readyz server
+deploy/observability/ Prometheus + Grafana (docker compose) and the dashboard (make_dashboard.py)
 internal/testcluster/ in-process 3+3 cluster for tests outside internal/server (client, chaos)
 pkg/client/           our smart cluster client: slot map, MOVED/ASK, COMMAND key positions, retry
                       budget + jittered backoff, RetrySafe/All/Never, per-node pools, replica reads
@@ -175,6 +177,7 @@ make run          # single node on 127.0.0.1:7000 (config: --flag > SHARDIS_* en
                   # --cluster-node-timeout 15000 (failure detection, ADR 027-029)
                   # --cluster-require-full-coverage yes|no
                   # --cluster-allow-reads-when-down yes|no (serve stale reads in a minority, ADR 030)
+                  # --metrics-port 9121   Prometheus /metrics, /healthz, /readyz (0 = off, ADR 045)
 SHARDIS_MEMTEST=1 go test ./internal/store -run TestMemoryPerKey -v   # heap bytes per key
 bash docs/benchmarks/iter-01-ping/run.sh          # PING benchmark vs real redis-server
 bash docs/benchmarks/iter-02-concurrency/run.sh   # engines vs real Redis (~8 min)
@@ -208,6 +211,8 @@ steps (e.g. always 114,220 req/s) and is slower than the single-threaded client.
 make cluster-up-local    # 6 local processes on 127.0.0.1:7000-7005 (deploy/local/topology.conf)
 make cluster-down-local
 make cluster-up          # 6 containers with docker compose (deploy/compose), same ports
+docker compose -f deploy/observability/docker-compose.yml up -d   # Prometheus :9090, Grafana :3000/d/shardis
+bin/shardis-observer -seed 127.0.0.1:7001 [-local-actions]       # http://127.0.0.1:8080 (live page, /ws)
 deploy/k8s/demos/up.sh   # minikube profile "shardis" (Calico), build image, deploy, form cluster
 deploy/k8s/demos/failover.sh | rolling-restart.sh | partition.sh | scale.sh   # each runs the checker Job
 deploy/k8s/demos/down.sh # delete the namespace (minikube stop -p shardis to stop the VM)

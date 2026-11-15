@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 )
 
 // command describes one command the server understands.
@@ -19,7 +20,17 @@ type command struct {
 	// smart clients can route without asking (ADR 022).
 	firstKey, lastKey, step int
 	run                     func(cl *client, args [][]byte)
+	id                      int // index into each client's call counters (set by New)
 }
+
+// maxCommands bounds the command table: each connection keeps one counter
+// per command (ADR 045).
+const maxCommands = 64
+
+// latencySample: time one command in this many per connection. The
+// histogram's shape is the same, at 1/16 of the clock reads and of the
+// cross-core contention on its buckets.
+const latencySample = 16
 
 // keysOf returns the key arguments of a command.
 func (c command) keysOf(args [][]byte) [][]byte {
@@ -137,7 +148,7 @@ func (s *Server) dispatch(cl *client, args [][]byte) {
 		cl.w.WriteError(fmt.Sprintf("ERR wrong number of arguments for '%s' command", name))
 		return
 	}
-	cl.cmds.Add(1)
+	n := cl.cmds.Add(1)
 	// Cluster routing comes first: a command for a slot we don't serve gets
 	// redirected before anything else looks at it (ADR 022).
 	if s.cluster != nil {
@@ -188,7 +199,16 @@ func (s *Server) dispatch(cl *client, args [][]byte) {
 			return
 		}
 	}
+	// Metrics (ADR 045). The counter is this connection's own, so cores never
+	// fight over it (one shared counter per command cost ~8% of throughput).
+	cl.calls[cmd.id].Add(1)
+	if n%latencySample != 1 { // the 1st, 17th, 33rd, ... command of each connection
+		cmd.run(cl, args)
+		return
+	}
+	t0 := time.Now()
 	cmd.run(cl, args)
+	s.latency.Observe(time.Since(t0).Seconds())
 }
 
 func arityOK(arity, n int) bool {

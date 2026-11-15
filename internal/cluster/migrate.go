@@ -156,6 +156,7 @@ func (c *Cluster) bumpEpochWithoutConsensus() {
 	c.currentEpoch++
 	c.myself.configEpoch = c.currentEpoch
 	c.log.Info("config epoch bumped for slot import", "epoch", c.myself.configEpoch)
+	c.stats.EpochBumps.Add(1)
 	c.emit("epoch_bump", map[string]any{"node": c.myself.label(), "epoch": c.myself.configEpoch, "reason": "import"})
 }
 
@@ -215,6 +216,7 @@ func (c *Cluster) TakeOver() error {
 	}
 	c.mu.Unlock()
 	c.log.Warn("took over my primary's slots (CLUSTER FAILOVER TAKEOVER)", "epoch", ev["epoch"], "slots", taken)
+	c.stats.Takeovers.Add(1)
 	c.emit("failover_takeover", ev)
 	if c.opts.Replicator != nil {
 		c.opts.Replicator.Promote()

@@ -251,3 +251,6 @@ func (d *decoder) str() string {
 	}
 	return string(d.take(int(b[0])))
 }
+
+// MessageTypes names the bus message types, in the order Stats indexes them.
+func MessageTypes() []string { return msgNames[:] }

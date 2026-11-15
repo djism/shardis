@@ -1,0 +1,3 @@
+apiVersion: 1
+providers:
+  - {name: shardis, type: file, options: {path: /var/lib/grafana/dashboards}}

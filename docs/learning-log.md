@@ -1249,3 +1249,78 @@ key it later checked. Under load, the first probe landed inside the split-brain 
 accepted, and with no failover in that scenario, the stale probe value stayed. The probe uses
 its own key now. This was the second time (after Iteration 10's reads-when-down test) that a
 probe write corrupted the thing being measured.
+
+## Iteration 15: Metrics + live event stream
+
+**What we built**
+- **Prometheus metrics** on an opt-in port: throughput, sampled latency, keys, memory, role,
+  slots, replication lag, cluster state, minority, PFAIL/FAIL, gossip by type, and counters for
+  elections, failovers, takeovers and epoch bumps. Plus Go runtime stats.
+- **A Grafana dashboard** in the repo, with a docker-compose Prometheus + Grafana stack.
+- **`shardis-observer`,** which merges every node's live event stream with a topology snapshot
+  into one WebSocket for the website. It can also trigger admin actions (kill, pause,
+  partition, heal, add node, rebalance), but only against a local cluster.
+
+**How it works**
+```
+ node a ─EVENTS──┐                         ┌─ /ws  → browser (website live mode)
+ node b ─EVENTS──┼──► shardis-observer ────┼─ /api/topology
+   …   ─EVENTS──┘    (+ CLUSTER NODES 1/s) └─ /api/actions (only -local-actions, only loopback)
+
+ node a ─/metrics :9121─┐
+   …                    ├──► Prometheus (2 s) ──► Grafana "Shardis cluster" dashboard
+ node f ─/metrics :9126─┘
+ hot path per command: +1 on THIS connection's counter; time 1 command in 16
+ everything else (roles, slots, lag, epochs…) is read when Prometheus asks
+```
+
+**Why we did it this way**
+- **Read metrics at scrape time (ADR 045).** The textbook version (a shared counter plus a
+  histogram on every command) cost **7–9% throughput** in every round: all cores hammering the
+  same memory. Per-connection counters and 1-in-16 latency sampling brought it back to
+  unmeasurable.
+- **An observer process with one WebSocket (ADR 046),** not WebSocket in every node.
+  Destructive actions are fenced three ways: an opt-in flag, loopback-only clusters, and a
+  loopback listener.
+
+**What can go wrong**
+- **Sampled latency** can miss a rare slow command.
+- **The observer is a single point of failure for the view** (not the cluster), and events are
+  lost while a node's stream reconnects.
+- **Anonymous Grafana and the unauthenticated observer are laptop tools.** They're bound to
+  127.0.0.1 for that reason.
+- **Found along the way:**
+  - The first metrics design's overhead (measured, then fixed).
+  - Sampling the 16th command meant one-command connections were never timed. It now samples
+    the 1st, 17th, ...
+  - `make build` didn't build the observer: the first live test "killed" nothing because
+    the binary didn't exist.
+
+**Try it yourself**
+```
+make build && make cluster-up-local
+docker compose -f deploy/observability/docker-compose.yml up -d
+bin/shardis-observer -seed 127.0.0.1:7001 -local-actions &      # http://127.0.0.1:8080
+bin/shardis-loadgen -cluster -addr 127.0.0.1:7001 -warmup 0 -duration 120s &
+open http://127.0.0.1:3000/d/shardis                              # Grafana
+curl -X POST 127.0.0.1:8080/api/actions -d '{"action":"kill","node":"a"}'
+#  ~16-19 s later: d's role turns primary, cluster state dips, failovers +1, on the dashboard and the live page
+docker compose -f deploy/observability/docker-compose.yml down; make cluster-down-local
+```
+
+**Interview question you can now answer**
+*"You added metrics and throughput dropped 8%. What happened?"*
+"Contention, not the work itself. I had one counter per command and one latency histogram, and
+every core was doing atomic adds to the same few cache lines, so they kept bouncing between
+cores. Even 'lock-free' atomics serialize on a shared cache line. The fix: each connection
+counts into its own counters, which a scrape adds up, and I time one command in sixteen per
+connection. Same information, no shared hot memory. After that, the overhead was within
+benchmark noise. Everything else, like roles, slots and replication lag, is read only when
+Prometheus scrapes, so it costs nothing between scrapes."
+
+**Check yourself**
+1. Why does the latency sample include each connection's *first* command, not just every 16th?
+<details><summary>Answer</summary>Many connections are short: a CLI session, a health check, a client that sends a few commands. Sampling only the 16th, 32nd... would never time them, so their latency would be invisible. Sampling the 1st, 17th, 33rd... keeps the same 1-in-16 rate overall and covers short connections too.</details>
+
+2. The observer refuses admin actions if any node isn't on a loopback address. Why that rule?
+<details><summary>Answer</summary>The actions kill and freeze real processes. On a laptop running the local cluster, that's the demo. Pointed at a shared Kubernetes cluster, the same button would take down real pods for everyone. "Every node is on this machine" is a simple, checkable stand-in for "this is your own throwaway cluster".</details>

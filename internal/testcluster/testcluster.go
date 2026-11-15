@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/djism/shardis/internal/cluster"
+	"github.com/djism/shardis/internal/events"
 	"github.com/djism/shardis/internal/faults"
 	"github.com/djism/shardis/internal/keyslot"
 	"github.com/djism/shardis/internal/replication"
@@ -44,6 +45,9 @@ type Node struct {
 	Port       int
 	Faults     *faults.Registry
 	Cluster    *cluster.Cluster
+	Server     *server.Server
+	Engine     store.Engine
+	Repl       *replication.Node
 	Stop       func() // like the process dying (idempotent)
 }
 
@@ -97,16 +101,17 @@ func Start(t testing.TB, o Options) *Cluster {
 func (tc *Cluster) startNode(t testing.TB, name string, port int, seed *cluster.Topology) *Node {
 	t.Helper()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	engine, _ := store.New(store.EngineSharded, store.Options{})
+	bus := events.NewBus(addr) // inactive (free) until someone subscribes with EVENTS
+	engine, _ := store.New(store.EngineSharded, store.Options{Bus: bus})
 	reg := faults.New()
 	repl := replication.NewNode(replication.Options{Engine: engine, PingPeriod: 100 * time.Millisecond,
-		Timeout: 2 * time.Second, AnnouncePort: port, AnnounceHost: "127.0.0.1", Faults: reg, Log: tc.quiet})
+		Timeout: 2 * time.Second, AnnouncePort: port, AnnounceHost: "127.0.0.1", Faults: reg, Bus: bus, Log: tc.quiet})
 	cl, err := cluster.New(cluster.Options{ClientAddr: addr, InternalAddr: addr, Seed: seed,
-		NodeTimeout: tc.opts.NodeTimeout, Replicator: repl, Faults: reg, Log: tc.quiet})
+		NodeTimeout: tc.opts.NodeTimeout, Replicator: repl, Faults: reg, Bus: bus, Log: tc.quiet})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := server.New(server.Options{Engine: engine, Repl: repl, Cluster: cl, Port: port, Hz: 10, Log: tc.quiet, Faults: reg})
+	s := server.New(server.Options{Engine: engine, Repl: repl, Cluster: cl, Port: port, Hz: 10, Log: tc.quiet, Faults: reg, Bus: bus})
 	if err := s.Listen(addr); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +124,7 @@ func (tc *Cluster) startNode(t testing.TB, name string, port int, seed *cluster.
 	if err := cl.Start(); err != nil {
 		t.Fatal(err)
 	}
-	return &Node{Name: name, Addr: addr, Port: port, Faults: reg, Cluster: cl, Stop: stop}
+	return &Node{Name: name, Addr: addr, Port: port, Faults: reg, Cluster: cl, Server: s, Engine: engine, Repl: repl, Stop: stop}
 }
 
 // AddEmpty starts a fresh node that knows nobody (like `--cluster-enabled

@@ -3,6 +3,7 @@
 # Usage: deploy/local/cluster.sh up|down|status
 # Logs and data go to .cluster-local/ in the repo root.
 # APPENDONLY=no turns persistence off (the benchmarks compare against Redis without it).
+# Metrics: node i serves Prometheus /metrics on 127.0.0.1:(9121+i).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 RUN=.cluster-local
@@ -20,8 +21,9 @@ start_node() { # index
     echo "node $n already running"; return
   fi
   mkdir -p "$RUN/$n"
+  # Prometheus metrics on 9121-9126 (deploy/observability scrapes these).
   ./bin/shardis --port "$port" --cluster-config "$TOPO" --cluster-node "$n" \
-    --appendonly "${APPENDONLY:-yes}" --dir "$RUN/$n" >>"$RUN/$n.log" 2>&1 &
+    --appendonly "${APPENDONLY:-yes}" --dir "$RUN/$n" --metrics-port $((9121 + $1)) >>"$RUN/$n.log" 2>&1 &
   echo $! >"$RUN/$n.pid"
 }
 

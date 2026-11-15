@@ -14,6 +14,7 @@ import (
 	"github.com/djism/shardis/internal/config"
 	"github.com/djism/shardis/internal/events"
 	"github.com/djism/shardis/internal/faults"
+	"github.com/djism/shardis/internal/metrics"
 	"github.com/djism/shardis/internal/persist"
 	"github.com/djism/shardis/internal/replication"
 	"github.com/djism/shardis/internal/server"
@@ -123,6 +124,17 @@ func run(ctx context.Context, args []string, getenv func(string) string) error {
 	}
 	slog.Info("shardis listening", "addr", srv.Addr().String(), "engine", engine.Name(), "hz", cfg.Hz,
 		"maxmemory", cfg.MaxMemory, "policy", policy)
+
+	if cfg.MetricsPort > 0 {
+		reg := metrics.NewRegistry(metrics.Sources{Server: srv, Engine: engine, Repl: repl, Cluster: cl})
+		maddr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.MetricsPort))
+		go func() {
+			if err := metrics.Serve(ctx, maddr, reg); err != nil {
+				slog.Error("metrics server failed", "addr", maddr, "err", err)
+			}
+		}()
+		slog.Info("metrics listening", "addr", maddr)
+	}
 
 	// On SIGTERM a cluster primary first hands its slots to its replica
 	// (ADR 043), and only then stops serving.

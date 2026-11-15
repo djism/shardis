@@ -1,0 +1,22 @@
+Cost of the hot-path metrics (ADR 045): a call counter per command and a latency histogram.
+One Shardis node in cluster mode owning all slots; redis-benchmark -t set,get -n 1000000 -c 50 -P 16
+-r 100000; rounds alternate the iter-14 binary (no metrics) and this one. Apple M4, macOS under heavy
+swap: single rounds swing by up to 2x, so look at the medians and at consistency.
+
+First version: one shared atomic counter per command + a histogram observation on every command.
+            SET req/s                               GET req/s
+before      1,449,275  1,355,014  1,416,431         1,547,988  1,438,849  1,501,502
+after       1,319,261  1,312,336  1,234,568         1,477,105  1,371,742  1,345,895
+→ slower in every round: median SET -7%, GET -9%. Every core added to the same counter and the
+  same histogram buckets: the cache lines bounced between cores (the trap Iteration 2 avoided for
+  the per-connection command count).
+
+Fixed: each connection counts calls in its own array (summed at scrape), and latency is timed for
+the 1st, 17th, 33rd... command of each connection.
+            SET req/s (6 rounds)                                          median
+before      1,314,061 1,060,445 1,353,180 1,154,734 1,161,440   678,887   1.158M
+after       1,153,403 1,169,591 1,345,895 1,170,960   698,324 1,173,709   1.170M
+            GET req/s (6 rounds)
+before      1,285,347   948,767 1,360,544 1,275,510 1,187,649 1,015,228   1.232M
+after       1,326,260   554,017 1,383,126 1,285,347   776,398 1,317,523   1.301M
+→ no measurable cost (after's medians are within noise of, even above, before's).

@@ -15,6 +15,7 @@ build: ## build binaries into bin/
 	go build -o bin/shardis-crashtest ./cmd/shardis-crashtest
 	go build -o bin/shardis-admin ./cmd/shardis-admin
 	go build -o bin/shardis-chaos ./cmd/shardis-chaos
+	go build -o bin/shardis-observer ./cmd/shardis-observer
 
 chaos: build ## run every chaos scenario: report table + traces in website/public/traces (~5 min)
 	bin/shardis-chaos
@@ -46,7 +47,7 @@ lint: vet ## fail if any file is not gofmt-formatted
 	@out=$$(gofmt -l $(GOFILES)); if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
 
 clean: ## remove build output
-	rm -f $(BIN) bin/shardis-loadgen bin/shardis-crashtest bin/shardis-admin bin/shardis-chaos
+	rm -f $(BIN) bin/shardis-loadgen bin/shardis-crashtest bin/shardis-admin bin/shardis-chaos bin/shardis-observer
 
 cluster-up-local: ## 6-node cluster as local processes on 127.0.0.1:7000-7005
 	deploy/local/cluster.sh up

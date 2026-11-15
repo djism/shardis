@@ -68,6 +68,9 @@ type Config struct {
 	// ClusterReadsWhenDown: serve reads while the cluster is down or this
 	// node is in a minority (cluster-allow-reads-when-down, default no).
 	ClusterReadsWhenDown bool
+
+	// MetricsPort serves Prometheus /metrics, /healthz, /readyz (0 = off, ADR 045).
+	MetricsPort int
 }
 
 // Load builds a Config from args (usually os.Args[1:]) and getenv (usually os.Getenv).
@@ -124,6 +127,9 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	str(fs, getenv, &fullCoverage, "cluster-require-full-coverage", "yes", "refuse all keyed commands while any slot is down (no = only those slots)")
 	str(fs, getenv, &readsDown, "cluster-allow-reads-when-down", "no", "serve (possibly stale) reads while the cluster is down or this node is in a minority")
 	str(fs, getenv, &cfg.ClusterNode, "cluster-node", "", "this node's name in the cluster topology file")
+	if err := integer(fs, getenv, &cfg.MetricsPort, "metrics-port", 0, "HTTP port for Prometheus /metrics, /healthz, /readyz (0 = off)"); err != nil {
+		return Config{}, err
+	}
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
