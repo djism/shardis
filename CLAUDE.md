@@ -123,7 +123,7 @@ cmd/shardis-loadgen/  Zipf "cache-aside" load generator (hit rate, latency)
 cmd/shardis-crashtest/ crash a real server mid-load, count lost acknowledged writes
 cmd/shardis-observer/ streams cluster events over WebSocket for the website
 cmd/shardis-chaos/    runs chaos scenarios + consistency checker, records traces
-cmd/shardis-admin/    add-node / reshard / rebalance / remove-node / fix (live slot migration)
+cmd/shardis-admin/    add-node / reshard / rebalance / remove-node / fix (thin wrapper over internal/admin)
 internal/resp/        protocol parser/writer
 internal/server/      TCP listener, per-connection loop, command table
 internal/config/      flags + SHARDIS_* env config
@@ -134,7 +134,10 @@ internal/replication/ PSYNC, backlog, full/partial sync, WAIT, promotion
 internal/cluster/     topology snapshots, cluster bus (wire, gossip), failure detection + failover, nodes.conf
 internal/events/      event bus
 internal/faults/      deterministic fault injection (FAULT SET repl.stream pause|delay|sever)
-pkg/client/           our own "smart" cluster client (slot map, MOVED, ASK; more in Iteration 12)
+internal/admin/       cluster operations as a library: AddNode, Reshard, Rebalance, Fix, RemoveNode
+internal/testcluster/ in-process 3+3 cluster for tests outside internal/server (client, chaos)
+pkg/client/           our smart cluster client: slot map, MOVED/ASK, COMMAND key positions, retry
+                      budget + jittered backoff, RetrySafe/All/Never, per-node pools, replica reads
 deploy/local/         6-node cluster as local processes (cluster.sh, topology.conf)
 deploy/compose/       docker-compose 6-node cluster (Dockerfile at repo root)
 deploy/k8s/           Kubernetes manifests (StatefulSet etc.)
@@ -186,6 +189,8 @@ bash docs/benchmarks/iter-09-failover/run.sh      # the failover timing table (~
 bin/shardis-crashtest -partition 2000,5000 -runs 10   # split-brain window + lost writes (ADR 030)
 bash docs/benchmarks/iter-10-partition/run.sh     # the partition table (~5 min)
 bash docs/benchmarks/iter-11-resharding/run.sh    # rebalance 3→4 primaries under load, vs Redis (~6 min)
+bin/shardis-crashtest -client-chaos safe,all,never -runs 5   # pause + crash + rebalance via pkg/client
+bash docs/benchmarks/iter-12-client/run.sh        # the client chaos table (~8 min)
 bash docs/benchmarks/iter-06-replication/run.sh   # the full failover table (~4 min)
 bash docs/benchmarks/iter-07-cluster/run.sh       # single node vs cluster, Shardis and Redis (~3 min)
 SHARDIS_GOSSIP_BENCH=$PWD/docs/benchmarks/iter-08-gossip/raw.csv go test ./internal/cluster -run TestGossipScaling -v -timeout 20m

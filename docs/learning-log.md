@@ -992,3 +992,90 @@ at scale."
 
 2. Why does the target node, not the source, take ownership first (`SETSLOT NODE`)?
 <details><summary>Answer</summary>While the source is still MIGRATING, it answers ASK for moved keys, and the target (now the owner) serves them. Everything works. If the source flipped first, it would say MOVED-to-target while the target, still only IMPORTING, says MOVED-back-to-source for clients without ASKING: a redirect loop. Target first means there's always a node willing to serve every key.</details>
+
+## Iteration 12: Our own smart client
+
+**What we built**
+`pkg/client` is now a real cluster client:
+- It learns every command's key positions from the server (`COMMAND`).
+- It follows MOVED and ASK.
+- It retries "not now" answers (dead node, CLUSTERDOWN, TRYAGAIN, READONLY) with jittered
+  backoff inside a time budget.
+- It pools connections per node, and can read from replicas.
+
+Its key feature is that it never applies a write twice behind your back. If a connection dies
+after an `INCR` was sent, it returns `ErrUnknownOutcome` instead of guessing.
+
+**How it works**
+```
+Do(ctx, "INCR", "ctr:7")
+  keys from COMMAND → slot 3412 → primary in our map
+  ┌── send ──────────────────────────────────────────────────────────────┐
+  │ reply OK / value         → done                                      │
+  │ MOVED / ASK              → go where it says (MOVED: fix the map)     │
+  │ TRYAGAIN / CLUSTERDOWN / READONLY / can't connect                    │
+  │                          → it certainly didn't run: back off, retry  │
+  │ connection died after sending → it MAY have run:                     │
+  │     safe to repeat? (GET, SET, DEL…)  → retry                        │
+  │     not safe (INCR…)                  → ErrUnknownOutcome            │
+  └── until MaxRetryTime (20 s): a failover becomes a slow call ────────┘
+```
+"Safe to repeat" (idempotent) means running it twice gives the same state *and* the same reply.
+`SET k v` is safe. `SET k v NX` isn't: the second run answers "not set", and the app would think
+it failed. `INCR` obviously isn't.
+
+**Why we did it this way**
+- **RetrySafe by default (ADR 036),** not at-least-once like go-redis's default (which, per its
+  source, retries every command after a lost connection). Measured: during a 1.5 s pause, RetryAll
+  applied **32 of 32 in-flight INCRs twice, in 5 of 5 runs**, with zero errors shown to the app.
+  RetrySafe reported them and doubled nothing.
+- **A time budget with exponential backoff and full jitter (ADR 037),** not a retry count.
+  Failovers take seconds, and jitter stops 50 clients from retrying in lockstep.
+- **Key positions from `COMMAND` (ADR 038),** so MSET is routed and checked correctly.
+- **Replica reads off by default (ADR 039),** because they're stale: 2.6–6.7% of immediate
+  read-after-writes returned old data, even on loopback.
+
+**What can go wrong**
+- **The app must handle `ErrUnknownOutcome`** for non-idempotent writes: read back, use request
+  IDs, or accept the risk.
+- **During a failover, requests to that shard are slow (up to ~3.5 s here), not failed.**
+  Latency-sensitive callers should pass a shorter context deadline.
+- **The client can't undo asynchronous replication.** RetryAll runs still lost up to 9
+  acknowledged INCRs when a primary was killed.
+- **No global retry budget or circuit breaker:** a dying cluster gets retries from every client.
+- **Found along the way:**
+  - The race detector caught a data race from Iteration 11: `SETSLOT NODE` read a node's epoch
+    for an event after releasing the cluster lock, while gossip could write it. Fixed.
+  - Under heavy CPU load, a partition test saw the split-brain overlap that ADR 030 warns about:
+    `a` acknowledged a write 0.7 ms after `d` took over. The test now bounds the overlap instead
+    of claiming it's always zero.
+  - Test packages running in parallel picked the same "free" ports. They now use separate
+    ranges.
+
+**Try it yourself**
+```
+go test ./pkg/client -run 'Failover|Reshard|ReplicaRead' -v     # failover/reshard with 0 errors; staleness %
+make build
+bin/shardis-crashtest -client-chaos safe,all -runs 1
+#  policy,run,pause_unknown,pause_doubled,...  safe: 32 unknown, 0 doubled; all: 0 unknown, 32 doubled
+bash docs/benchmarks/iter-12-client/run.sh                       # 5 runs per policy (~8 min)
+```
+
+**Interview question you can now answer**
+*"Your client times out on a write. Should it retry?"*
+"It depends on whether the write is idempotent, because a timeout doesn't tell you whether the
+command ran. If the connection was never made, or the server said MOVED or CLUSTERDOWN, it
+definitely didn't run, so retrying is always safe. But if I sent it and the connection died, it
+might have run. Retrying a SET is fine, since running it twice gives the same result. Retrying
+an INCR can count twice. I measured it: with a 1.5 second pause on one node and a 500 ms client
+timeout, retry-everything applied all 32 in-flight INCRs twice, every run, and the app saw no
+errors at all. So my client retries only idempotent commands after an unknown outcome and
+returns a specific error for the rest. The real fix is idempotency keys on the server side,
+like Stripe or Kafka's idempotent producer, so every write becomes safe to retry."
+
+**Check yourself**
+1. Why is `SET lock me NX` not safe to resend even though running it twice leaves the same state?
+<details><summary>Answer</summary>Because its reply changes. If the first SET NX ran and took the lock, the resent one finds the key already set and answers nil ("not set"). The application then believes it didn't get the lock, though it did, and may never release it. "Idempotent" has to cover the reply the caller acts on, not just the stored state.</details>
+
+2. A primary is killed while INCRs are in flight. Why did RetryAll cause *duplicates* during the pause but not during the crash?
+<details><summary>Answer</summary>A paused node wakes up and still runs the commands waiting in its socket buffers, so the original and the resent INCR both run. A killed node's in-flight INCRs usually never reached its replica before it died, so the resent INCR on the new primary is the only copy that survives. Duplicates come from nodes that are slow, not dead. (A crash can still lose acknowledged writes, which no retry policy fixes.)</details>

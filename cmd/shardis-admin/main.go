@@ -1,6 +1,7 @@
 // Command shardis-admin changes a running cluster: add or remove nodes, and
 // move hash slots between primaries while clients keep working (live
-// resharding, ADR 032).
+// resharding, ADR 032). The logic lives in internal/admin, which the crash
+// tool and tests use too.
 //
 //	shardis-admin add-node    -addr 127.0.0.1:7000 -new 127.0.0.1:7006 [-replica-of <primary-id>]
 //	shardis-admin reshard     -addr 127.0.0.1:7000 -from <id> -to <id> -slots 1000
@@ -17,6 +18,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/djism/shardis/internal/admin"
 )
 
 func main() {
@@ -26,10 +29,10 @@ func main() {
 	cmd, args := os.Args[1], os.Args[2:]
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:7000", "any node of the cluster")
-	o := moveOptions{}
-	fs.IntVar(&o.batch, "batch", 100, "keys per MIGRATE")
-	fs.IntVar(&o.timeoutMs, "migrate-timeout", 10000, "MIGRATE timeout (ms)")
-	fs.BoolVar(&o.verbose, "v", false, "print every slot moved")
+	o := admin.MoveOptions{Out: os.Stderr}
+	fs.IntVar(&o.Batch, "batch", 100, "keys per MIGRATE")
+	fs.IntVar(&o.TimeoutMs, "migrate-timeout", 10000, "MIGRATE timeout (ms)")
+	fs.BoolVar(&o.Verbose, "v", false, "print every slot moved")
 	newNode := fs.String("new", "", "add-node: the new node's address")
 	replicaOf := fs.String("replica-of", "", "add-node: make the new node a replica of this primary ID")
 	from := fs.String("from", "", "reshard: source primary ID")
@@ -42,18 +45,22 @@ func main() {
 	var err error
 	switch cmd {
 	case "add-node":
-		err = addNode(*addr, *newNode, *replicaOf)
+		var newID string
+		if newID, err = admin.AddNode(*addr, *newNode, *replicaOf); err == nil {
+			fmt.Printf("added %s (%s)\n", *newNode, newID)
+		}
 	case "reshard":
-		err = reshard(*addr, *from, *to, *slots, o)
+		err = admin.Reshard(*addr, *from, *to, *slots, o)
 	case "rebalance":
-		err = rebalance(*addr, o)
+		err = admin.Rebalance(*addr, o)
 	case "remove-node":
-		err = removeNode(*addr, *id)
+		if err = admin.RemoveNode(*addr, *id); err == nil {
+			fmt.Println("removed; stop its process now")
+		}
 	case "fix":
-		o.fix = true
-		err = fix(*addr, o)
+		err = admin.Fix(*addr, o)
 	case "nodes":
-		err = printNodes(*addr)
+		err = admin.PrintNodes(*addr, os.Stdout)
 	default:
 		usage()
 	}

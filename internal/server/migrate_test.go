@@ -216,7 +216,7 @@ func TestMigrateUnderConcurrentWrites(t *testing.T) {
 	incr := []func(key string) error{
 		func(key string) error { return rc.Incr(ctx, key).Err() },
 		func(key string) error {
-			v, err := ours.Do([]byte("INCR"), []byte(key))
+			v, err := ours.Do(ctx, []byte("INCR"), []byte(key))
 			if err == nil && v.Kind == resp.Error {
 				err = fmt.Errorf("%s", v.Str)
 			}

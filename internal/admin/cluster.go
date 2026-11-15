@@ -1,7 +1,8 @@
-package main
+package admin
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"slices"
 	"strconv"
@@ -179,7 +180,8 @@ func (v *view) find(id string) (*node, error) {
 	return nil, fmt.Errorf("no node %q", id)
 }
 
-func printNodes(addr string) error {
+// PrintNodes writes who owns how many slots, and open slots, to w.
+func PrintNodes(addr string, w io.Writer) error {
 	v, err := load(addr)
 	if err != nil {
 		return err
@@ -191,40 +193,41 @@ func printNodes(addr string) error {
 				replicas++
 			}
 		}
-		fmt.Printf("%s  %5d slots  %d replica(s)", p.short(), len(p.slots), replicas)
+		fmt.Fprintf(w, "%s  %5d slots  %d replica(s)", p.short(), len(p.slots), replicas)
 		for s, id := range p.migrating {
-			fmt.Printf("  [%d -> %s]", s, id[:8])
+			fmt.Fprintf(w, "  [%d -> %s]", s, id[:8])
 		}
 		for s, id := range p.importing {
-			fmt.Printf("  [%d <- %s]", s, id[:8])
+			fmt.Fprintf(w, "  [%d <- %s]", s, id[:8])
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 	return nil
 }
 
-// addNode introduces a new (empty) node to the cluster: the new node MEETs
-// an existing one, and gossip introduces it to everyone else.
-func addNode(existing, newAddr, replicaOf string) error {
+// AddNode introduces a new (empty) node to the cluster: the new node MEETs
+// an existing one, and gossip introduces it to everyone else. It returns
+// once every node knows the newcomer, with the newcomer's ID.
+func AddNode(existing, newAddr, replicaOf string) (string, error) {
 	if newAddr == "" {
-		return fmt.Errorf("-new is required")
+		return "", fmt.Errorf("-new is required")
 	}
 	host, port, err := net.SplitHostPort(existing)
 	if err != nil {
-		return err
+		return "", err
 	}
 	c, err := dial(newAddr)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer c.close()
 	idv, err := c.do("CLUSTER", "MYID")
 	if err != nil {
-		return err
+		return "", err
 	}
 	newID := string(idv.Str)
 	if _, err := c.do("CLUSTER", "MEET", host, port); err != nil {
-		return err
+		return "", err
 	}
 	// Wait until *every* node knows the new one, not just the one we met:
 	// the others hear about it by gossip, a moment later. A reshard started
@@ -233,17 +236,16 @@ func addNode(existing, newAddr, replicaOf string) error {
 	deadline := time.Now().Add(30 * time.Second)
 	for !everyoneKnows(existing, newID) {
 		if time.Now().After(deadline) {
-			return fmt.Errorf("the cluster never fully learned about %s", newAddr)
+			return "", fmt.Errorf("the cluster never fully learned about %s", newAddr)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	if replicaOf != "" {
 		if _, err := c.do("CLUSTER", "REPLICATE", replicaOf); err != nil {
-			return err
+			return "", err
 		}
 	}
-	fmt.Printf("added %s (%s)\n", newAddr, newID)
-	return nil
+	return newID, nil
 }
 
 // everyoneKnows reports whether every node reachable from addr lists id as
@@ -292,10 +294,10 @@ func (v *view) waitAgreement(timeout time.Duration) error {
 	}
 }
 
-// removeNode makes every other node forget an empty node. Stop its process
+// RemoveNode makes every other node forget an empty node. Stop its process
 // right after: a node that keeps running would keep trying to talk to the
 // others.
-func removeNode(addr, id string) error {
+func RemoveNode(addr, id string) error {
 	v, err := load(addr)
 	if err != nil {
 		return err
@@ -329,6 +331,5 @@ func removeNode(addr, id string) error {
 			return fmt.Errorf("%s: %w", n.short(), err)
 		}
 	}
-	fmt.Printf("removed %s; stop its process now\n", gone.short())
 	return nil
 }

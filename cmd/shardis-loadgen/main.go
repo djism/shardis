@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"hash/fnv"
@@ -219,7 +220,7 @@ func preload(o options, cc *client.Cluster, value []byte) error {
 // client, or on a dedicated connection to a single server.
 func connect(o options, cc *client.Cluster) (func(args ...[]byte) (resp.Value, error), func(), error) {
 	if cc != nil {
-		return cc.Do, func() {}, nil
+		return func(args ...[]byte) (resp.Value, error) { return cc.Do(context.Background(), args...) }, func() {}, nil
 	}
 	conn, err := net.Dial("tcp", o.addr)
 	if err != nil {

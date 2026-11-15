@@ -125,8 +125,11 @@ func (c *Cluster) SetSlotNode(slot uint16, id string, keysHere int) error {
 	}
 	c.dirty = true
 	c.publish()
+	// Built under the lock: gossip may update n.configEpoch the moment we
+	// unlock (the race detector caught us reading it after).
+	ev := map[string]any{"node": c.myself.label(), "slot": slot, "owner": n.label(), "epoch": n.configEpoch}
 	c.mu.Unlock()
-	c.emit("slot_owner", map[string]any{"node": c.myself.label(), "slot": slot, "owner": n.label(), "epoch": n.configEpoch})
+	c.emit("slot_owner", ev)
 	if replicateFrom != "" {
 		return c.startReplication(replicateFrom)
 	}

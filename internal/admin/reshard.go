@@ -1,20 +1,35 @@
-package main
+package admin
 
 import (
 	"fmt"
+	"io"
 	"maps"
 	"net"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
-type moveOptions struct {
-	batch, timeoutMs int
-	verbose          bool
-	fix              bool // MIGRATE with REPLACE: finishing a crashed run (see fix)
+// MoveOptions tunes slot moves.
+type MoveOptions struct {
+	Batch     int       // keys per MIGRATE (default 100)
+	TimeoutMs int       // MIGRATE timeout (default 10000)
+	Verbose   bool      // log every slot
+	Fix       bool      // MIGRATE with REPLACE: finishing a crashed run (see Fix)
+	Out       io.Writer // progress messages; nil = discard
+}
+
+func (o *MoveOptions) defaults() {
+	if o.Batch == 0 {
+		o.Batch = 100
+	}
+	if o.TimeoutMs == 0 {
+		o.TimeoutMs = 10000
+	}
+	if o.Out == nil {
+		o.Out = io.Discard
+	}
 }
 
 // moveSlot moves one slot from src to dst while clients keep using it. The
@@ -30,7 +45,7 @@ type moveOptions struct {
 //  5. src NODE dst: src now answers MOVED dst.
 //  6. Every other primary NODE dst, so they stop sending clients to src. (Gossip
 //     would get there too, but this is faster.)
-func moveSlot(v *view, src, dst *node, slot int, o moveOptions) (keys int, err error) {
+func moveSlot(v *view, src, dst *node, slot int, o MoveOptions) (keys int, err error) {
 	s := strconv.Itoa(slot)
 	sc, err := v.conn(src.addr)
 	if err != nil {
@@ -53,15 +68,15 @@ func moveSlot(v *view, src, dst *node, slot int, o moveOptions) (keys int, err e
 	}
 	host, port, _ := net.SplitHostPort(dst.addr)
 	for {
-		kv, err := sc.do("CLUSTER", "GETKEYSINSLOT", s, strconv.Itoa(o.batch))
+		kv, err := sc.do("CLUSTER", "GETKEYSINSLOT", s, strconv.Itoa(o.Batch))
 		if err != nil {
 			return keys, err
 		}
 		if len(kv.Elems) == 0 {
 			break
 		}
-		args := [][]byte{[]byte("MIGRATE"), []byte(host), []byte(port), {}, []byte("0"), []byte(strconv.Itoa(o.timeoutMs))}
-		if o.fix {
+		args := [][]byte{[]byte("MIGRATE"), []byte(host), []byte(port), {}, []byte("0"), []byte(strconv.Itoa(o.TimeoutMs))}
+		if o.Fix {
 			args = append(args, []byte("REPLACE"))
 		}
 		args = append(args, []byte("KEYS"))
@@ -69,7 +84,7 @@ func moveSlot(v *view, src, dst *node, slot int, o moveOptions) (keys int, err e
 			args = append(args, k.Str)
 		}
 		if _, err := sc.doBytes(args...); err != nil {
-			if strings.Contains(err.Error(), "BUSYKEY") && !o.fix {
+			if strings.Contains(err.Error(), "BUSYKEY") && !o.Fix {
 				return keys, fmt.Errorf("slot %d: %w (the target already has some of these keys; run `shardis-admin fix` to overwrite them with the source's copy)", slot, err)
 			}
 			return keys, fmt.Errorf("slot %d: %w", slot, err)
@@ -82,8 +97,8 @@ func moveSlot(v *view, src, dst *node, slot int, o moveOptions) (keys int, err e
 	if err := finishSlot(v, sc, src, dst, s); err != nil {
 		return keys, err
 	}
-	if o.verbose {
-		fmt.Fprintf(os.Stderr, "slot %d: %s -> %s, %d keys\n", slot, src.short(), dst.short(), keys)
+	if o.Verbose {
+		fmt.Fprintf(o.Out, "slot %d: %s -> %s, %d keys\n", slot, src.short(), dst.short(), keys)
 	}
 	return keys, nil
 }
@@ -114,7 +129,7 @@ type move struct {
 	slot     int
 }
 
-func run(v *view, moves []move, o moveOptions) error {
+func run(v *view, moves []move, o MoveOptions) error {
 	total := 0
 	for i, m := range moves {
 		k, err := moveSlot(v, m.src, m.dst, m.slot, o)
@@ -122,16 +137,17 @@ func run(v *view, moves []move, o moveOptions) error {
 		if err != nil {
 			return fmt.Errorf("after %d of %d slots: %w", i, len(moves), err)
 		}
-		if !o.verbose && (i+1)%256 == 0 {
-			fmt.Fprintf(os.Stderr, "%d/%d slots moved (%d keys)\n", i+1, len(moves), total)
+		if !o.Verbose && (i+1)%256 == 0 {
+			fmt.Fprintf(o.Out, "%d/%d slots moved (%d keys)\n", i+1, len(moves), total)
 		}
 	}
-	fmt.Printf("moved %d slots, %d keys\n", len(moves), total)
+	fmt.Fprintf(o.Out, "moved %d slots, %d keys\n", len(moves), total)
 	return nil
 }
 
-// reshard moves n slots from one primary to another.
-func reshard(addr, fromID, toID string, n int, o moveOptions) error {
+// Reshard moves n slots from one primary to another.
+func Reshard(addr, fromID, toID string, n int, o MoveOptions) error {
+	o.defaults()
 	v, err := load(addr)
 	if err != nil {
 		return err
@@ -160,10 +176,11 @@ func reshard(addr, fromID, toID string, n int, o moveOptions) error {
 	return run(v, moves, o)
 }
 
-// rebalance gives every primary (empty ones included) an equal share of the
+// Rebalance gives every primary (empty ones included) an equal share of the
 // 16384 slots, moving as few slots as possible: primaries above their share
 // give their highest slots to primaries below it.
-func rebalance(addr string, o moveOptions) error {
+func Rebalance(addr string, o MoveOptions) error {
+	o.defaults()
 	v, err := load(addr)
 	if err != nil {
 		return err
@@ -176,10 +193,10 @@ func rebalance(addr string, o moveOptions) error {
 	}
 	moves := plan(v.primaries)
 	if len(moves) == 0 {
-		fmt.Println("already balanced")
+		fmt.Fprintln(o.Out, "already balanced")
 		return nil
 	}
-	fmt.Fprintf(os.Stderr, "moving %d slots across %d primaries\n", len(moves), len(v.primaries))
+	fmt.Fprintf(o.Out, "moving %d slots across %d primaries\n", len(moves), len(v.primaries))
 	return run(v, moves, o)
 }
 
@@ -230,13 +247,15 @@ func refuseOpenSlots(v *view) error {
 	return nil
 }
 
-// fix finishes every half-moved slot. A slot is "open" if its owner is
+// Fix finishes every half-moved slot. A slot is "open" if its owner is
 // MIGRATING it or some node is IMPORTING it. We finish the move toward the
 // node that was importing (or the migration target): keys left on the
 // source are moved with REPLACE, because the source's copy is the newest. While
 // the slot was MIGRATING, the source served every key it still had, so a
 // copy the target holds from an interrupted MIGRATE can only be older.
-func fix(addr string, o moveOptions) error {
+func Fix(addr string, o MoveOptions) error {
+	o.defaults()
+	o.Fix = true
 	v, err := load(addr)
 	if err != nil {
 		return err
@@ -256,13 +275,13 @@ func fix(addr string, o moveOptions) error {
 		}
 	}
 	if len(slotsOpen) == 0 {
-		fmt.Println("no open slots")
+		fmt.Fprintln(o.Out, "no open slots")
 		return nil
 	}
 	var moves []move
 	for _, s := range slices.Sorted(maps.Keys(slotsOpen)) {
 		moves = append(moves, move{slotsOpen[s].src, slotsOpen[s].dst, s})
 	}
-	fmt.Fprintf(os.Stderr, "finishing %d half-moved slot(s)\n", len(moves))
+	fmt.Fprintf(o.Out, "finishing %d half-moved slot(s)\n", len(moves))
 	return run(v, moves, o)
 }

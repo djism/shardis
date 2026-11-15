@@ -37,6 +37,12 @@
 // partition.go).
 //
 //	shardis-crashtest -partition 2000,5000 -runs 10
+//
+// With -client-chaos it runs a crash, failover, restart and rebalance under
+// load through our smart client and counts what the application saw (see
+// client_chaos.go).
+//
+//	shardis-crashtest -client-chaos safe,all,never -runs 5
 package main
 
 import (
@@ -81,6 +87,7 @@ func main() {
 	failover := flag.String("failover", "", "replication failover test instead: variants plain,wait,slowlink,slowlink+wait")
 	clusterFailover := flag.String("cluster-failover", "", "cluster failover timing instead: node timeouts in ms, e.g. 2000,5000")
 	partition := flag.String("partition", "", "network partition (split-brain window) test instead: node timeouts in ms")
+	clientChaos := flag.String("client-chaos", "", "smart-client chaos test instead: retry policies, e.g. safe,all,never")
 	flag.Parse()
 	o.policies, o.modes = strings.Split(policies, ","), strings.Split(modes, ",")
 	if *failover != "" {
@@ -93,6 +100,10 @@ func main() {
 	}
 	if *partition != "" {
 		runPartition(o, strings.Split(*partition, ","))
+		return
+	}
+	if *clientChaos != "" {
+		runClientChaos(o, strings.Split(*clientChaos, ","))
 		return
 	}
 
