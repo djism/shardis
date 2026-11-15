@@ -453,8 +453,8 @@ func (t *Tx) sampleExpired(s uint16, max int) (sampled, expired int) {
 func (t *Tx) hasVolatile(s uint16) bool { return len(t.ks.volatile[s]) > 0 }
 
 func (t *Tx) emitWrite(op string, key []byte, slot uint16) {
-	if t.bus.Active() { // one atomic load when nobody's listening
-		t.bus.Emit("key_write", map[string]any{"op": op, "key": string(key), "slot": slot})
+	if t.bus.WantsKeyWrites() { // one atomic load when nobody wants them (ADR 007, 041)
+		t.bus.Emit(events.KeyWrite, map[string]any{"op": op, "key": string(key), "slot": slot})
 	}
 }
 

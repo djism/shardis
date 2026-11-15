@@ -4,7 +4,7 @@ PKG     := ./...
 GOFILES := $(shell find . -name '*.go' -not -path './website/*')
 
 .DEFAULT_GOAL := help
-.PHONY: help build test test-memory fuzz bench run fmt vet lint clean cluster-up cluster-down cluster-up-local cluster-down-local
+.PHONY: help build chaos test test-memory fuzz bench run fmt vet lint clean cluster-up cluster-down cluster-up-local cluster-down-local
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -14,6 +14,10 @@ build: ## build binaries into bin/
 	go build -o bin/shardis-loadgen ./cmd/shardis-loadgen
 	go build -o bin/shardis-crashtest ./cmd/shardis-crashtest
 	go build -o bin/shardis-admin ./cmd/shardis-admin
+	go build -o bin/shardis-chaos ./cmd/shardis-chaos
+
+chaos: build ## run every chaos scenario: report table + traces in website/public/traces (~5 min)
+	bin/shardis-chaos
 
 test: ## run all tests with the race detector
 	go test -race -count=1 $(PKG)
@@ -42,7 +46,7 @@ lint: vet ## fail if any file is not gofmt-formatted
 	@out=$$(gofmt -l $(GOFILES)); if [ -n "$$out" ]; then echo "needs gofmt:"; echo "$$out"; exit 1; fi
 
 clean: ## remove build output
-	rm -f $(BIN) bin/shardis-loadgen bin/shardis-crashtest bin/shardis-admin
+	rm -f $(BIN) bin/shardis-loadgen bin/shardis-crashtest bin/shardis-admin bin/shardis-chaos
 
 cluster-up-local: ## 6-node cluster as local processes on 127.0.0.1:7000-7005
 	deploy/local/cluster.sh up

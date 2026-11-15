@@ -29,7 +29,8 @@ type Event struct {
 type Bus struct {
 	node string
 
-	active atomic.Int32 // number of subscribers; read on every Active() call
+	active     atomic.Int32 // number of subscribers; read on every Active() call
+	keyWriters atomic.Int32 // subscribers that want key_write (the one high-volume type)
 
 	mu   sync.RWMutex // guards subs; Emit holds it for reading while sending
 	subs map[*Subscription]struct{}
@@ -43,6 +44,15 @@ func NewBus(node string) *Bus {
 // event so the no-listener path costs one atomic load and no allocations.
 func (b *Bus) Active() bool { return b != nil && b.active.Load() > 0 }
 
+// KeyWrite is the per-key write event, emitted on every write. It's the one
+// type worth filtering at the source: a stream that doesn't want it
+// mustn't make the store build 100k events a second just to drop them.
+const KeyWrite = "key_write"
+
+// WantsKeyWrites reports whether any subscriber wants key_write events.
+// The store checks this instead of Active().
+func (b *Bus) WantsKeyWrites() bool { return b != nil && b.keyWriters.Load() > 0 }
+
 // Emit delivers an event to every subscriber without blocking.
 func (b *Bus) Emit(typ string, data map[string]any) {
 	if !b.Active() {
@@ -52,6 +62,9 @@ func (b *Bus) Emit(typ string, data map[string]any) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	for s := range b.subs {
+		if s.exclude[typ] {
+			continue
+		}
 		select {
 		case s.ch <- e:
 		default:
@@ -64,16 +77,26 @@ func (b *Bus) Emit(typ string, data map[string]any) {
 type Subscription struct {
 	bus     *Bus
 	ch      chan Event
+	exclude map[string]bool // types this subscriber doesn't want (fixed at Subscribe)
 	dropped atomic.Uint64
 	once    sync.Once
 }
 
-// Subscribe registers a listener with room for buffer pending events.
-func (b *Bus) Subscribe(buffer int) *Subscription {
-	s := &Subscription{bus: b, ch: make(chan Event, buffer)}
+// Subscribe registers a listener for every event type, with room for
+// buffer pending events.
+func (b *Bus) Subscribe(buffer int) *Subscription { return b.SubscribeExcept(buffer, nil) }
+
+// SubscribeExcept registers a listener for every type except those in
+// exclude. Excluding KeyWrite also stops the store from producing them, if
+// no other subscriber wants them.
+func (b *Bus) SubscribeExcept(buffer int, exclude map[string]bool) *Subscription {
+	s := &Subscription{bus: b, ch: make(chan Event, buffer), exclude: exclude}
 	b.mu.Lock()
 	b.subs[s] = struct{}{}
 	b.active.Add(1)
+	if !exclude[KeyWrite] {
+		b.keyWriters.Add(1)
+	}
 	b.mu.Unlock()
 	return s
 }
@@ -91,6 +114,9 @@ func (s *Subscription) Close() {
 		s.bus.mu.Lock()
 		delete(s.bus.subs, s)
 		s.bus.active.Add(-1)
+		if !s.exclude[KeyWrite] {
+			s.bus.keyWriters.Add(-1)
+		}
 		s.bus.mu.Unlock()
 		close(s.ch)
 	})

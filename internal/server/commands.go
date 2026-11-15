@@ -68,6 +68,7 @@ func (s *Server) commandTable() map[string]command {
 		"info":    {arity: -1, run: cmdInfo},
 
 		"client": {arity: -2, run: cmdClient},
+		"events": {arity: -1, run: cmdEvents}, // live event stream (cmd_events.go)
 
 		// cluster (cmd_cluster.go)
 		"cluster":   {arity: -2, run: cmdCluster},

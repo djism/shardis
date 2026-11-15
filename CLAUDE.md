@@ -122,7 +122,7 @@ cmd/shardis/          server binary
 cmd/shardis-loadgen/  Zipf "cache-aside" load generator (hit rate, latency)
 cmd/shardis-crashtest/ crash a real server mid-load, count lost acknowledged writes
 cmd/shardis-observer/ streams cluster events over WebSocket for the website
-cmd/shardis-chaos/    runs chaos scenarios + consistency checker, records traces
+cmd/shardis-chaos/    7 chaos scenarios on real processes + history checker; traces → website/public/traces
 cmd/shardis-admin/    add-node / reshard / rebalance / remove-node / fix (thin wrapper over internal/admin)
 internal/resp/        protocol parser/writer
 internal/server/      TCP listener, per-connection loop, command table
@@ -152,7 +152,9 @@ ROADMAP.md            iteration plan
 
 ```
 make help         # list all targets
-make build        # build binaries (bin/shardis, bin/shardis-loadgen, bin/shardis-crashtest, bin/shardis-admin)
+make build        # build binaries (bin/shardis, -loadgen, -crashtest, -admin, -chaos)
+make chaos        # every chaos scenario: report table, docs/benchmarks/iter-13-chaos/report.csv, traces (~5 min)
+                  # bin/shardis-chaos -list | -scenarios kill-primary,slow-node
 make test         # go test -race ./...
 make test-memory  # heap-measuring tests (skipped under -race; CI runs both)
 make lint         # go vet + gofmt check (what CI runs first)
@@ -211,6 +213,8 @@ SHARDIS_ENABLE_FAULT_INJECTION=yes make cluster-up-local   # SHARDIS_* env reach
 redis-cli -p 7000 fault partition a   # send to EVERY node: cut a off (bus + replication), ADR 031
 redis-cli -p 7000 fault heal          # send to every node: remove all fault rules
 rm -rf .cluster-local    # forget saved nodes.conf (otherwise earlier failovers are remembered)
+(printf 'EVENTS\r\n'; sleep 5) | nc 127.0.0.1 7001   # live JSON event stream (EVENTS ALL adds key writes, ADR 041;
+                                                      # redis-cli can't stream it: it exits after the OK)
 bin/shardis-admin nodes -addr 127.0.0.1:7000      # slots per primary, open (half-moved) slots
 bin/shardis --port 7006 --dir /tmp/g --cluster-enabled yes &   # an empty node to add
 bin/shardis-admin add-node -addr 127.0.0.1:7000 -new 127.0.0.1:7006   # waits until everyone knows it

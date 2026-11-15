@@ -55,7 +55,7 @@ func moveSlot(v *view, src, dst *node, slot int, o MoveOptions) (keys int, err e
 	if err != nil {
 		return 0, err
 	}
-	if slices.Contains(dst.slots, slot) {
+	if src == dst || slices.Contains(dst.slots, slot) {
 		// A run crashed after step 4: dst already owns the slot. Only
 		// steps 5-6 are left.
 		return 0, finishSlot(v, sc, src, dst, s)
@@ -253,6 +253,12 @@ func refuseOpenSlots(v *view) error {
 // source are moved with REPLACE, because the source's copy is the newest. While
 // the slot was MIGRATING, the source served every key it still had, so a
 // copy the target holds from an interrupted MIGRATE can only be older.
+//
+// The source is always the slot's *current* owner, not the node named in
+// the marker. If the original source died mid-move and its replica took
+// over (reshard-during-failover), the replica owns the slot now. It has
+// the source's unmigrated keys (by replication) but none of its markers,
+// since markers aren't replicated (ADR 032).
 func Fix(addr string, o MoveOptions) error {
 	o.defaults()
 	o.Fix = true
@@ -260,18 +266,36 @@ func Fix(addr string, o MoveOptions) error {
 	if err != nil {
 		return err
 	}
+	owner := map[int]*node{}
+	for _, p := range v.primaries {
+		for _, s := range p.slots {
+			owner[s] = p
+		}
+	}
 	type open struct{ src, dst *node }
 	slotsOpen := map[int]open{}
 	for _, p := range v.primaries {
 		for s, id := range p.migrating {
-			if dst := v.byID[id]; dst != nil {
-				slotsOpen[s] = open{p, dst}
+			dst := v.byID[id]
+			if dst == nil || !slices.Contains(v.primaries, dst) {
+				// The target is gone. Cancel the move: the slot stays where it is.
+				// Keys already sent to the dead target are only on its
+				// replica now, which doesn't own the slot: reported, not recovered.
+				fmt.Fprintf(o.Out, "slot %d: target %s is gone; cancelling the move (keys already moved there may be stranded)\n", s, id[:8])
+				if c, err := v.conn(p.addr); err == nil {
+					c.do("CLUSTER", "SETSLOT", strconv.Itoa(s), "STABLE")
+				}
+				continue
 			}
+			slotsOpen[s] = open{p, dst}
 		}
-		for s, id := range p.importing {
-			if src := v.byID[id]; src != nil {
-				slotsOpen[s] = open{src, p}
+		for s := range p.importing {
+			src := owner[s]
+			if src == nil {
+				fmt.Fprintf(o.Out, "slot %d: no healthy owner; skipped\n", s)
+				continue
 			}
+			slotsOpen[s] = open{src, p}
 		}
 	}
 	if len(slotsOpen) == 0 {

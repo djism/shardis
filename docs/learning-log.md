@@ -1079,3 +1079,87 @@ like Stripe or Kafka's idempotent producer, so every write becomes safe to retry
 
 2. A primary is killed while INCRs are in flight. Why did RetryAll cause *duplicates* during the pause but not during the crash?
 <details><summary>Answer</summary>A paused node wakes up and still runs the commands waiting in its socket buffers, so the original and the resent INCR both run. A killed node's in-flight INCRs usually never reached its replica before it died, so the resent INCR on the new primary is the only copy that survives. Duplicates come from nodes that are slow, not dead. (A crash can still lose acknowledged writes, which no retry policy fixes.)</details>
+
+## Iteration 13: Chaos suite + consistency checker
+
+**What we built**
+`make chaos` runs seven failure scenarios against seven real Shardis processes while a recorded
+workload runs through our client:
+- kill a primary, kill a replica
+- partition a primary away, flap its network
+- freeze a node
+- crash a node in the middle of a rebalance
+- restart everything
+
+A checker then goes through every recorded operation and reports errors, lost and rolled-back
+writes, stale reads, phantom values, the longest stall and p99 latency. Each run is saved as a
+trace (node events + chaos actions + client timeline) for the website. A new `EVENTS` command
+lets any tool stream a node's internal events live.
+
+**How it works**
+```
+ writers: SET chaos:k 1, 2, 3, ...  (each key only goes UP)      readers: GET random keys
+        │ every op recorded: start, end, ok/failed                         │
+        ▼                                                                  ▼
+ ┌──── 7 processes ───────────────────────────────┐   EVENTS streams (gossip, PFAIL, FAIL,
+ │ a b c (primaries)  d e f (replicas)  g (empty) │──▶ votes, failover_won, slot moves…)
+ └────────────────────────────────────────────────┘   + chaos actions (kill, pause, partition)
+        fault script: kill -9 / SIGSTOP / FAULT PARTITION / rebalance+kill / restart all
+ then the checker:
+   rolled back = acked write that a later read didn't see (the value went DOWN)
+   stale read  = read lower than a value acked before the read started
+   phantom     = a value nobody wrote
+```
+Because each key's value only ever goes up, "did we lose something?" has an exact, cheap
+answer. No linearizability solver needed.
+
+**Why we did it this way**
+- **Increasing registers instead of a full linearizability check (ADR 040).** Redis Cluster
+  isn't linearizable, so that check would just say "no". We measure the specific things that
+  should hold, and count the ones that don't.
+- **"Rolled back", not just "lost at the end".** The first real partition run showed 251 stale
+  reads and **0** lost writes. The losses were real, but later writes to the same keys hid them.
+  Counting acked writes that a later read didn't see caught **3,480** of them.
+- **An `EVENTS` command (ADR 041)** rather than log files or a new port. Excluded event types
+  aren't even produced (the store stops building per-write events when nobody wants them).
+- **Real processes with kill -9, SIGSTOP and FAULT PARTITION (ADR 042),** not the in-process
+  test cluster: crashes and AOF replays are real.
+
+**What can go wrong**
+- **Partitions lose acknowledged writes:** 3,480 rolled back and 200 stale reads in one run,
+  while the final state looked perfect.
+- **The numbers are best cases:** one machine, loopback network, paced load. Crashes lost
+  nothing here. Iteration 9 lost up to 146 writes under heavier load, and Iteration 5's
+  power-cut test showed what `kill -9` hides: a process crash leaves the OS page cache intact.
+- **Our simulated partitions are harsher than real ones:** a dropped PING is gone for good,
+  where TCP would retransmit it. 1.5 s "flaps" (under the 2 s timeout) still caused a failover.
+- **Single runs vary:** `flapping-network` had 103 stale reads in one run and 0 in the next.
+- **Fixed along the way:** `shardis-admin fix` couldn't finish a slot whose source died and
+  failed over mid-rebalance. It now takes the slot's current owner as the source.
+
+**Try it yourself**
+```
+make chaos                                    # ~5 min: the table below, plus traces
+bin/shardis-chaos -list
+bin/shardis-chaos -scenarios partition-minority-primary -csv ""
+python3 -c "import json;t=json.load(open('website/public/traces/kill-primary.json'));print([(e['t'],e['node'],e['type']) for e in t['events'] if e['type'] in ('chaos','fail','failover_won')])"
+make cluster-up-local && (printf 'EVENTS\r\n'; sleep 5) | nc 127.0.0.1 7001   # live gossip (redis-cli exits after OK)
+```
+
+**Interview question you can now answer**
+*"How do you test that a distributed database doesn't lose data?"*
+"You record a history of every operation (when it started, when it ended, what it returned),
+inject real failures while it runs, and check the history afterwards. I made the check exact
+by having each writer write increasing numbers to keys only it owns. Any read that's lower than
+a write that had already been acknowledged means the system went backwards. On my Redis Cluster
+clone, seven scenarios produced zero client errors, but the partition scenario rolled back
+3,480 acknowledged writes. A naive check of the final state reported zero, because later writes
+covered the gap. Checking only the end state can certify a split brain as harmless. That's the
+Jepsen mindset: don't trust the final state, check what clients actually observed."
+
+**Check yourself**
+1. Why does the checker need writers to write *increasing* values?
+<details><summary>Answer</summary>So a value can only legitimately go up. Then "the value went down" (a read or the final state lower than an acknowledged write) is an exact, local proof of a lost or rolled-back write, checkable in linear time, with no need to search for a valid ordering of all operations the way a linearizability checker does.</details>
+
+2. `restart-all` kills every node with `kill -9` and loses nothing, with fsync only every second. Why isn't that proof the data is safe?
+<details><summary>Answer</summary>`kill -9` ends the process but not the OS: data already written to the file is in the kernel's page cache and reaches the disk later anyway. Only a power cut or kernel crash loses that last second. Iteration 5's simulated power loss is the test that shows it.</details>
